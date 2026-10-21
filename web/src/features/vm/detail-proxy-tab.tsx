@@ -24,6 +24,7 @@ import {
 } from '@/components/ui/popover'
 import { TabsContent } from '@/components/ui/tabs'
 import { StatusMark } from '@/components/status-mark'
+import { VmIpPoolCard } from '@/features/ip-pool/vm-ip-pool-card'
 import { HealthDonut } from '@/features/overview/health-gauge'
 import {
   proxyIsLocal,
@@ -85,6 +86,8 @@ export function VmProxyTab(props: VmProxyTabProps) {
   const selected = free.find((p) => p.id === selectedId)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [nodeQuery, setNodeQuery] = useState('')
+  const [ipPoolManaged, setIpPoolManaged] = useState(true)
+  const canManageLegacy = canManage && !ipPoolManaged
   const q = nodeQuery.trim().toLowerCase()
   // 下拉里显示的是带节点名的标签（本地代理），裸地址匹配不到它，两边都比。
   const matched = q
@@ -97,6 +100,13 @@ export function VmProxyTab(props: VmProxyTabProps) {
 
   return (
     <TabsContent value='proxy' className='space-y-3 pt-4'>
+      {canManage ? (
+        <VmIpPoolCard
+          key={vm.id}
+          vmId={vm.id}
+          onManagedChange={setIpPoolManaged}
+        />
+      ) : null}
       <Card>
         <CardHeader className='pb-2'>
           <CardTitle className='text-sm'>
@@ -203,7 +213,7 @@ export function VmProxyTab(props: VmProxyTabProps) {
           </div>
         </CardContent>
       </Card>
-      {canManage ? (
+      {canManageLegacy ? (
         <div className='flex flex-wrap gap-2'>
           {boundId ? (
             <>
@@ -251,7 +261,7 @@ export function VmProxyTab(props: VmProxyTabProps) {
           </Button>
         </div>
       ) : null}
-      {!canManage ? null : free.length ? (
+      {!canManageLegacy ? null : free.length ? (
         <div className='flex gap-2'>
           <Popover
             open={pickerOpen}

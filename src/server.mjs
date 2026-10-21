@@ -476,6 +476,7 @@ const vmTestSchedule = new VmTestScheduleRunner({
     }),
 })
 credentialRefreshMonitor = createCredentialRefreshMonitor({
+  isMaintenance: (id) => !!getVm(cfg.paths.project, id)?.ip_pool_maintenance?.operation_id,
   config: normalizeCredentialRefreshConfig(routingConfig.credential_refresh),
   listTargets: () =>
     listVms(cfg.paths.project).map((vm) => {
@@ -517,6 +518,7 @@ kernelWatchdog = createKernelWatchdog({
 })
 
 usageProbeMonitor = createUsageProbeMonitor({
+  isMaintenance: (id) => !!getVm(cfg.paths.project, id)?.ip_pool_maintenance?.operation_id,
   config: routingConfig.usage_probe,
   listTargets: () => listVms(cfg.paths.project),
   accountForVm: accountForUsageProbe,
@@ -947,6 +949,9 @@ cliNodeGuard = createCliNodeGuard({
 })
 
 const handlePanel = createPanelHandler({
+  get credentialRefreshMonitor() {
+    return credentialRefreshMonitor
+  },
   json,
   writeSSEHeaders,
   readBody,

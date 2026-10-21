@@ -950,6 +950,8 @@ export class PoolScheduler extends EventEmitter {
     return candidates
   }
   async checkEligibility({ vm, accountId, state, model, now, signal, pinned = false, quotaRequest = null }) {
+    const maintenanceVm = this.projectRoot && vm?.id ? getVm(this.projectRoot, vm.id) : vm
+    if (maintenanceVm?.ip_pool_maintenance?.operation_id) return { ok: false, reason: 'ip_pool_maintenance' }
     // sub2api IsSchedulable: rate_limit_reset_at / overload_until gate before any
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
     const hardBlock = pinned ? null : hardBlockOf(state, now)
@@ -1415,6 +1417,10 @@ export class PoolScheduler extends EventEmitter {
    * Seats are layered on top by claimSeat().
    */
   reserve(candidate, { skipQuota = false, pinned = false } = {}) {
+    // Re-read at the synchronous claim boundary: a candidate may predate an IP change.
+    // Maintenance also blocks master pins, which intentionally bypass ordinary scheduling holds.
+    const liveVm = this.projectRoot && candidate.vmId ? getVm(this.projectRoot, candidate.vmId) : candidate.vm
+    if (liveVm?.ip_pool_maintenance?.operation_id) return null
     const requestInflight = this.inflight.get(candidate.accountId) || 0
     if (!candidate.maxConcurrency || requestInflight >= candidate.maxConcurrency) return null
     const family = isFableModel(candidate.model) ? FABLE_FAMILY_KEY : null

@@ -610,8 +610,10 @@ export function vmRunning(vm: Vm | undefined): boolean {
   if (!vm) return false
   const s = String(vm.status || '').toLowerCase()
   if (s === 'stopped' || s === 'dead' || s === 'disabled') return false
+  // A running slot can still be waiting for its first credential import.
+  if (s === 'running') return true
   if (!vm.has_token) return false
-  return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
+  return Boolean(vm.active || s === 'ok' || !s)
 }
 
 /** Same mapping as codex-proxy-rs `plan_type_display`; unknown raw values pass through. */

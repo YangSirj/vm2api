@@ -54,6 +54,7 @@ export function vmHasProxyPath(vm) {
 
 export function isCredentialRefreshTarget(vm) {
   if (!vm?.id) return false
+  if (vm.ip_pool_maintenance?.operation_id) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh) return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_DOWN.has(status)) return false
@@ -99,10 +100,12 @@ export function createCredentialRefreshMonitor(opts = {}) {
   let inflight = null
   let lastRun = null
   const nowFn = opts.now || (() => Date.now())
+  const refreshing = new Map()
+  const maintenance = (vm) => !!(vm?.ip_pool_maintenance?.operation_id || opts.isMaintenance?.(vm.id))
 
   const listDue = () => {
     const vms = typeof opts.listTargets === 'function' ? opts.listTargets() || [] : []
-    return vms.filter((vm) => isCredentialRefreshTarget(vm) && needsScheduledRefresh(vm, nowFn()))
+    return vms.filter((vm) => isCredentialRefreshTarget(vm) && !maintenance(vm) && needsScheduledRefresh(vm, nowFn()))
   }
 
   const runOnce = async () => {
@@ -114,7 +117,13 @@ export function createCredentialRefreshMonitor(opts = {}) {
       if (due.length && typeof opts.refreshOne === 'function') {
         await mapPool(due, config.concurrency, async (vm) => {
           try {
-            const result = await opts.refreshOne(vm, config)
+            if (maintenance(vm)) {
+              items.push({ vm_id: vm.id, ok: false, refresh_class: 'ip_pool_maintenance' })
+              return
+            }
+            const pending = Promise.resolve(opts.refreshOne(vm, config))
+            refreshing.set(vm.id, pending)
+            const result = await pending
             items.push({
               vm_id: vm.id,
               schedulable: vm.schedulable !== false,
@@ -129,6 +138,8 @@ export function createCredentialRefreshMonitor(opts = {}) {
               refresh_class: 'retryable',
               error: String(error?.message || error).slice(0, 200),
             })
+          } finally {
+            refreshing.delete(vm.id)
           }
         })
       }
@@ -174,6 +185,7 @@ export function createCredentialRefreshMonitor(opts = {}) {
   }
 
   return {
+    inflightForVm: (id) => (refreshing.has(id) ? 1 : 0),
     getConfig: () => config,
     setConfig,
     getSnapshot: () => lastRun,

@@ -4,6 +4,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { createIpPoolPanel } from '../ip-pool/panel.mjs'
 import {
   verifyPanelLogin,
   createPanelSession,
@@ -589,6 +590,7 @@ function slotProxyHint(px = {}, label = null) {
 }
 
 export function createPanelHandler(ctx) {
+  const ipPoolPanel = createIpPoolPanel(ctx)
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
   const json = (...args) => ctx.json(...args)
@@ -600,7 +602,7 @@ export function createPanelHandler(ctx) {
     })
     return true
   }
-  const readBody = (...args) => ctx.readBody(...args)
+  const readBody = (...args) => ipPoolPanel.readBody(...args)
   const readRawBody = (...args) => (ctx.readRawBody || defaultReadRawBody)(...args)
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
@@ -1374,6 +1376,7 @@ export function createPanelHandler(ctx) {
       ) {
         return true
       }
+      if (await ipPoolPanel.handle(req, res, p)) return true
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
           const body = await readBody(req, 4096).catch(() => ({}))

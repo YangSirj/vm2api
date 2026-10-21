@@ -18,6 +18,7 @@ import {
   scheduleStateLabel,
   vmCircuit,
   vmCircuitTitle,
+  vmRunning,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -33,6 +34,30 @@ function liveVm(over: Partial<Vm> = {}): Vm {
     ...over,
   }
 }
+
+describe('slot power state', () => {
+  it('shows an explicitly running slot before credentials are imported', () => {
+    expect(
+      vmRunning({ id: 'vm-01', status: 'running', has_token: false })
+    ).toBe(true)
+    expect(vmRunning({ id: 'vm-01', status: 'running' })).toBe(true)
+  })
+
+  it('keeps an explicitly stopped slot stopped even with credentials or a stale active flag', () => {
+    expect(
+      vmRunning({
+        id: 'vm-01',
+        status: 'stopped',
+        has_token: true,
+        active: true,
+      })
+    ).toBe(false)
+  })
+
+  it('does not infer running from missing credentials and unknown power state', () => {
+    expect(vmRunning({ id: 'vm-01', has_token: false })).toBe(false)
+  })
+})
 
 describe('health probe must not paint a live ticket unavailable', () => {
   it('ignores availability.bad from test-chat credential_refresh_failed', () => {

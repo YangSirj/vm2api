@@ -102,6 +102,7 @@ export function slotHasBoundProxy(vm) {
 }
 
 export function evaluateSlotGate(vm) {
+  if (vm?.ip_pool_maintenance?.operation_id) return { ok: false, reason: 'ip_pool_maintenance' }
   if (isCodexVm(vm)) return { ok: false, reason: 'codex_vm' }
   const blocked = proxyBlockedReason(vm?.proxy)
   if (blocked) return { ok: false, reason: blocked }

@@ -59,6 +59,7 @@ export function normalizeUsageProbeConfig(raw = {}) {
 
 export function isUsageProbeTarget(vm) {
   if (!vm?.id) return false
+  if (vm.ip_pool_maintenance?.operation_id) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh && !vm.has_token) return false
   const grantErr = String(vm.claude?.refresh_error || vm.refresh_error || '')
   if (/invalid_grant|refresh token not found/i.test(grantErr)) return false
@@ -198,13 +199,16 @@ export function createUsageProbeMonitor(opts = {}) {
   const nowFn = opts.now || (() => Date.now())
   // One /usage hop per VM at a time, shared by the timer and 429 events.
   const probing = new Map()
+  // A timeout ends the monitor's wait, not necessarily the underlying HTTP request.
+  const activeHops = new Map()
+  const maintenance = (vm) => !!(vm?.ip_pool_maintenance?.operation_id || opts.isMaintenance?.(vm.id))
   const backoff = new Map()
   const queue = []
   let running = 0
 
   const listTargets = () => {
     const vms = typeof opts.listTargets === 'function' ? opts.listTargets() || [] : []
-    return vms.filter((vm) => isUsageProbeTarget(vm))
+    return vms.filter((vm) => isUsageProbeTarget(vm) && !maintenance(vm))
   }
 
   const takeWorker = () => {
@@ -228,6 +232,7 @@ export function createUsageProbeMonitor(opts = {}) {
    */
   const probeVm = (vm, reason) => {
     const id = vm.id
+    if (maintenance(vm)) return Promise.resolve({ vm_id: id, ok: false, reason: 'ip_pool_maintenance', source: null })
     if (probing.has(id)) return probing.get(id)
     const parked = backoff.get(id)
     if (parked && parked.until > nowFn()) {
@@ -238,7 +243,18 @@ export function createUsageProbeMonitor(opts = {}) {
     const run = worker
       .then(async () => {
         try {
-          const result = await withTimeout(Promise.resolve(opts.probeOne(vm)), config.timeout_ms)
+          if (maintenance(vm)) return { vm_id: id, ok: false, reason: 'ip_pool_maintenance', source: null }
+          const hop = Promise.resolve(opts.probeOne(vm))
+          const active = activeHops.get(id) || new Set()
+          active.add(hop)
+          activeHops.set(id, active)
+          void hop
+            .finally(() => {
+              active.delete(hop)
+              if (!active.size) activeHops.delete(id)
+            })
+            .catch(() => {})
+          const result = await withTimeout(hop, config.timeout_ms)
           const ok = result?.ok !== false
           if (ok) backoff.delete(id)
           else {
@@ -360,6 +376,7 @@ export function createUsageProbeMonitor(opts = {}) {
   }
 
   return {
+    inflightForVm: (id) => activeHops.get(id)?.size || 0,
     getConfig: () => config,
     setConfig,
     getSnapshot: () => lastRun,
