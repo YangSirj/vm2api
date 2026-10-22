@@ -39,6 +39,14 @@ IP 池的 `GET /api/v1/capabilities` 必须返回 `features.exact_exit_ip = true
 
 ## 版本与验证
 
+可用 IP 列表于 `2026-10-22T13:10:08Z` 部署，产品提交为 `be0a9e40`。当前镜像为 `vm2api-ip-pool:candidate-list-20261022T131003Z`，ID 为 `sha256:99c6f17fb61d462c3bb24b34e98dbf0670e246d12aec6b3de1ccbce421e602e9`，控制面起点为 `2026-10-22T13:10:04.738808319Z`，发布目录为 `/opt/vm2api/releases/candidate-list-20261022T131003Z`。294 个部署文件 SHA256 一致；只重建控制面，槽位记录、IP 池视图、路由、环境及其他容器保持。
+
+本轮后端三个 IP 池套件 63/63、前端四个 IP 池测试文件 28/28 通过；TypeScript、前端构建、ESLint、Biome、格式和 diff 检查通过。独立代码及契约复核未发现阻断问题。
+
+线上只读验收于 `2026-10-22T13:10:22Z` 查询 `vm-01` 和 `vm-02`：均获得 10 个唯一公网 IP、`complete=true`，与独立直接遍历上游的候选集合一致。分配对象、本地持久化文件、完整 IP 池视图和所有容器身份及起点在查询前后不变，模型请求为 0。现场 `asg_3` v10、`asg_5` v2 均已释放，不能把历史应用记录当作当前分配。
+
+浏览器确认列表数量、IP 搜索、点选回填、无效手动输入校验及刷新均正常，最终保留未选择、未勾选的列表窗口，未提交分配。私有证据为 `.local/ip-pool-rollout/evidence/candidate-list-verification.json`、`candidate-list-acceptance.json`、`candidate-list-ui.json` 及 `candidate-list-ui.png`。本轮不修改上游；下文是先前指定出口功能的部署与实测记录。
+
 首次部署于 2026-10-22 北京时间 20:32 完成线上验收。vm2api 部署镜像为 `vm2api-ip-pool:exact-exit-20261022T121532Z`，实际 ID 为 `sha256:0b1adfd2156fb845732db898fb33ebaef82321b2dadba3869b8b7963ca2774f0`，控制面起点为 `2026-10-22T12:15:33.859580596Z`，发布目录为 `/opt/vm2api/releases/exact-exit-20261022T121532Z`。293 个部署文件 SHA256 核对一致；原槽位记录、IP 池视图、路由、环境和其他容器均未变。
 
 首次上游补丁于 `2026-10-22T12:26:24Z` 部署，基线 SHA256 为 `62103c0f459040cabfe0f1697a180a03fb2037cea63ad5efd99af7ba6358336c`，目标 SHA256 为 `04067e1d1233f25e1d51eab773ec2d2ac335c7cc6e08d54d604bd8af12bd2d00`，备份目录为 `/opt/xray-biz/backups/exact-exit-20261022T122623Z`；仅重启 Web 服务，代理引擎未变。
