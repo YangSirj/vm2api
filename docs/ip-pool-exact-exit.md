@@ -76,3 +76,5 @@ IP 池的 `GET /api/v1/capabilities` 必须返回 `features.exact_exit_ip = true
 首次部署的私有证据保存在 `.local/ip-pool-rollout/evidence/`：`exact-exit-acceptance.json`、`exact-exit-verification.json`、`upstream-exact-verification.json`；运行状态原始文件不提交到仓库。
 
 完整的配置、登录锁、故障恢复和升级注意事项见 [IP 池对接说明](ip-pool-integration.md)。
+
+2026-10-22 21:20（北京时间）已将“指定公网 IP”的搜索与手动填写合成一个输入框：输入 IP/地区筛选，点选回填同一框，也可直接填写完整公网 IP。已构建并部署到阿里云 64G；按用户要求未运行测试。代码提交 `ea5b37f2f107966067d5efe651cfb0bde5928ec7`，镜像 `vm2api-ip-pool:candidate-single-input-20261022T132038Z`。仅重新创建控制容器，账号、出口和槽数据保持原样。
