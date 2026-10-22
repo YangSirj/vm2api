@@ -146,50 +146,16 @@ export function ConfirmPoolAction({
           </p>
         )}
         {targeted ? (
-          <>
-            <PoolCandidatePicker
-              vmId={vmId}
-              value={normalizedTargetIp}
-              currentIp={kind === 'replace' ? exitIp : ''}
-              disabled={busy || !available}
-              onSelect={(ip) => {
-                setTargetIp(ip)
-                setConfirmed(false)
-              }}
-            />
-            <div className='space-y-2'>
-              <Label htmlFor='ip-pool-target-ip'>
-                目标公网 IP（也可手动输入）
-              </Label>
-              <Input
-                id='ip-pool-target-ip'
-                value={targetIp}
-                disabled={busy || !available}
-                autoComplete='off'
-                autoCapitalize='none'
-                spellCheck={false}
-                placeholder='例如 203.0.113.9 或 2001:db8::9'
-                aria-invalid={Boolean(targetIp && !normalizedTargetIp)}
-                aria-describedby='ip-pool-target-ip-help'
-                onChange={(event) => {
-                  setTargetIp(event.target.value)
-                  setConfirmed(false)
-                }}
-              />
-              <p
-                id='ip-pool-target-ip-help'
-                className={
-                  targetIp && !normalizedTargetIp
-                    ? 'text-xs text-destructive'
-                    : 'text-xs text-muted-foreground'
-                }
-              >
-                {targetIp && !normalizedTargetIp
-                  ? '请输入有效的 IPv4 或 IPv6 地址，不要填写域名、端口或代理链接。'
-                  : '填写 IP 池中的公网出口地址，支持 IPv4 和 IPv6。'}
-              </p>
-            </div>
-          </>
+          <PoolCandidatePicker
+            vmId={vmId}
+            value={normalizedTargetIp}
+            currentIp={kind === 'replace' ? exitIp : ''}
+            disabled={busy || !available}
+            onSelect={(ip) => {
+              setTargetIp(ip)
+              setConfirmed(false)
+            }}
+          />
         ) : null}
         <label className='flex items-start gap-2 text-sm'>
           <input

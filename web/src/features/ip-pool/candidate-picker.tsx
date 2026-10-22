@@ -57,19 +57,31 @@ export function PoolCandidatePicker({
         </Button>
       </div>
       <div className='space-y-1.5'>
-        <Label htmlFor='ip-pool-candidate-search'>搜索 IP 或地区</Label>
+        <Label htmlFor='ip-pool-candidate-search'>目标公网 IP</Label>
         <Input
           id='ip-pool-candidate-search'
           value={search}
           disabled={disabled}
           autoComplete='off'
-          placeholder='输入 IP、国家代码、地区或城市'
-          onChange={(event) => setSearch(event.target.value)}
+          autoCapitalize='none'
+          spellCheck={false}
+          placeholder='搜索 IP / 地区，或输入指定 IP'
+          aria-describedby='ip-pool-candidate-help'
+          onChange={(event) => {
+            setSearch(event.target.value)
+            onSelect(event.target.value)
+          }}
         />
+        <p
+          id='ip-pool-candidate-help'
+          className='text-xs text-muted-foreground'
+        >
+          输入关键词筛选，点击下方 IP 选定；也可直接填写完整 IPv4 或 IPv6 地址。
+        </p>
       </div>
       {q.isPending ? (
         <p role='status' className='p-3 text-sm text-muted-foreground'>
-          正在读取可用 IP…也可以在下方手动输入。
+          正在读取可用 IP…也可以直接输入指定 IP。
         </p>
       ) : null}
       {q.isError ? (
@@ -107,7 +119,10 @@ export function PoolCandidatePicker({
                         disabled={disabled}
                         aria-pressed={selected}
                         aria-label={`选择公网 IP ${candidate.exit_ip}`}
-                        onClick={() => onSelect(candidate.exit_ip)}
+                        onClick={() => {
+                          setSearch(candidate.exit_ip)
+                          onSelect(candidate.exit_ip)
+                        }}
                       >
                         <span className='flex flex-wrap items-center gap-x-2 gap-y-1'>
                           <span className='font-mono break-all'>
