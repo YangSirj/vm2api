@@ -15,6 +15,7 @@ import {
   poolActions,
   poolManaged,
   poolOperationBusy,
+  poolTargetAction,
   stateLabels,
   type IpPoolAction,
 } from './model'
@@ -53,9 +54,10 @@ export function VmIpPoolCard({
   const qc = useQueryClient()
   const [pending, setPending] = useState<IpPoolAction | 'access' | null>(null)
   const actionLock = useRef(false)
-  const [confirm, setConfirm] = useState<
-    'replace' | 'release' | 'blacklist' | null
-  >(null)
+  const [confirm, setConfirm] = useState<{
+    kind: 'assign' | 'replace' | 'release' | 'blacklist'
+    targeted?: boolean
+  } | null>(null)
   const q = useQuery({
     queryKey: poolQueryKey(vmId),
     queryFn: ({ signal }) => readPool(vmId, signal),
@@ -152,6 +154,7 @@ export function VmIpPoolCard({
     view?.state !== 'blacklisted' &&
     (view?.login_locked || view?.state === 'login_locked')
   const consistent = view ? assignmentApplied(view) : false
+  const targetAction = view ? poolTargetAction(view) : null
 
   function actionButton(action: IpPoolAction) {
     if (!actions?.[action]) return null
@@ -170,7 +173,7 @@ export function VmIpPoolCard({
             action === 'release' ||
             action === 'blacklist'
           )
-            setConfirm(action)
+            setConfirm({ kind: action })
           else void run(action)
         }}
       >
@@ -303,6 +306,18 @@ export function VmIpPoolCard({
             <div className='flex flex-wrap gap-2'>
               {actionButton('assign')}
               {actionButton('apply')}
+              {targetAction ? (
+                <Button
+                  size='sm'
+                  variant='outline'
+                  disabled={busy}
+                  onClick={() =>
+                    setConfirm({ kind: targetAction, targeted: true })
+                  }
+                >
+                  指定公网 IP
+                </Button>
+              ) : null}
               {actions?.access ? (
                 <Button
                   size='sm'
@@ -334,14 +349,16 @@ export function VmIpPoolCard({
       </CardContent>
       {confirm && view ? (
         <ConfirmPoolAction
-          key={confirm}
-          kind={confirm}
+          key={`${confirm.kind}:${Boolean(confirm.targeted)}`}
+          kind={confirm.kind}
+          targeted={confirm.targeted}
           exitIp={
             view.applied?.exit_ip || view.assignment?.current_exit_ip || ''
           }
           busy={Boolean(pending)}
+          available={!busy && Boolean(actions?.[confirm.kind])}
           onClose={() => setConfirm(null)}
-          onConfirm={(body) => run(confirm, body)}
+          onConfirm={(body) => run(confirm.kind, body)}
         />
       ) : null}
     </Card>

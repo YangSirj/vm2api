@@ -1,0 +1,100 @@
+--- pool_api.py.before
++++ pool_api.py.target
+@@ -465,7 +465,7 @@
+             "features": {"assignments": "immediate", "exclusive_exit": "opt_in", "reservations": False,
+                          "operations": False, "idempotency_keys": False, "holds": False, "observations": False,
+                          "incidents": False, "webhooks": False, "credential_rotation": "on_reclaim", "bulk": False, "settle": True,
+-                         "probes": "sync", "blacklist": True, "events": True},
++                         "probes": "sync", "blacklist": True, "events": True, "exact_exit_ip": True},
+             "notes": ["分配即生效,没有预留和提交两段;同一 consumer_ref 重复分配返回原分配,改动类请求带 expected_version 防并发",
+                       "出口默认可被多个账号共用;policy.exclusive_exit=true 时只分配无人占用的出口,并且之后不再分给别人",
+                       "节点删除或标黑后,用它的分配变成 paused,需调用 replacements 换新",
+@@ -609,22 +609,37 @@
+         if not ref or len(ref) > 128:
+             raise ApiError(400, "INVALID_ARGUMENT", "consumer_ref 必填,最长 128 字")
+         label = str(b.get("consumer_label") or "")[:80]
++        target_exit_ip = canon_ip(b["target_exit_ip"], "target_exit_ip") if "target_exit_ip" in b else None
+         with self.app.alloc_lock:
+             r = self.db.one("SELECT * FROM assignments WHERE client = ? AND consumer_ref = ?", (me, ref))
+             policy = norm_policy(b.get("policy")) if (r is None or "policy" in b) else json.loads(r["policy"] or "{}")
+             anchor = json.loads(r["anchor"]) if r and r["anchor"] else self.anchor_from_body(b)
+-            # 没指定节点:已分配的原样返回,让重试安全
+-            if r and r["state"] != "released" and not (b.get("proxy_id") or b.get("exit_ip")):
+-                return 200, {"assignment": self.asg(r), "created": False}, None
+-            c, _ = self.forced(b, anchor, policy, set(), set(), r["id"] if r else None)
+-            # 指定的正好是手上这个节点,也算重复调用
+-            if r and r["state"] != "released" and c and pid(c["proxy_id"], "px") == r["node_id"]:
+-                return 200, {"assignment": self.asg(r), "created": False}, None
+-            if not c:
+-                cands, stats, cc = self.select(anchor, policy, set(), set(), None)
+-                if not cands:
+-                    self.no_candidate(stats, policy, cc)
+-                c = cands[0]
++            if target_exit_ip is not None:
++                if r and r["state"] != "released":
++                    if (not r["exit_ip"] or canon_ip(r["exit_ip"]) != target_exit_ip or
++                            ("proxy_id" in b and b["proxy_id"] != ("px_%d" % r["node_id"] if r["node_id"] else None))):
++                        raise ApiError(409, "CANDIDATE_INELIGIBLE", "现有分配与指定的出口不一致,请调用 replacements",
++                                       details={"target_exit_ip": target_exit_ip})
++                    return 200, {"assignment": self.asg(r), "created": False}, None
++                cands, stats, cc = self.select(anchor, policy, set(), set(), r["id"] if r else None)
++                c = next((x for x in cands if canon_ip(x["exit_ip"]) == target_exit_ip and
++                          ("proxy_id" not in b or x["proxy_id"] == b["proxy_id"])), None)
++                if c is None:
++                    raise ApiError(409, "CANDIDATE_INELIGIBLE", "指定的出口现在不符合条件,重新预览",
++                                   details={"target_exit_ip": target_exit_ip, "excluded": stats})
++            else:
++                # 没指定节点:已分配的原样返回,让重试安全
++                if r and r["state"] != "released" and not (b.get("proxy_id") or b.get("exit_ip")):
++                    return 200, {"assignment": self.asg(r), "created": False}, None
++                c, _ = self.forced(b, anchor, policy, set(), set(), r["id"] if r else None)
++                # 指定的正好是手上这个节点,也算重复调用
++                if r and r["state"] != "released" and c and pid(c["proxy_id"], "px") == r["node_id"]:
++                    return 200, {"assignment": self.asg(r), "created": False}, None
++                if not c:
++                    cands, stats, cc = self.select(anchor, policy, set(), set(), None)
++                    if not cands:
++                        self.no_candidate(stats, policy, cc)
++                    c = cands[0]
+             n = self.node(pid(c["proxy_id"], "px"))
+             if not anchor:
+                 anchor = self.anchor_of_node(n, "first_assignment")
+@@ -651,6 +666,7 @@
+                      "forced": c.get("forced", False), "skipped": c.get("skipped", [])}, None
+ 
+     def replace(self, me, aid, b):
++        target_exit_ip = canon_ip(b["target_exit_ip"], "target_exit_ip") if "target_exit_ip" in b else None
+         with self.app.alloc_lock:
+             r = self.own(me, aid)
+             self.check_version(r, b)
+@@ -661,7 +677,9 @@
+             excl_ids = {pid(x, "px") for x in (b.get("exclude_proxy_ids") or [])}
+             excl_ips = {canon_ip(x, "exclude_exit_ips") for x in (b.get("exclude_exit_ips") or [])}
+             # 显式指定的节点优先,不受 require_new_exit_ip 影响
+-            c, _ = self.forced(b, anchor, policy, excl_ids, excl_ips, r["id"])
++            c = None
++            if target_exit_ip is None:
++                c, _ = self.forced(b, anchor, policy, excl_ids, excl_ips, r["id"])
+             if b.get("require_new_exit_ip", True) is not False:
+                 if r["exit_ip"]:
+                     excl_ips.add(r["exit_ip"])
+@@ -669,9 +687,16 @@
+                     excl_ids.add(r["node_id"])
+             if not c:
+                 cands, stats, cc = self.select(anchor, policy, excl_ids, excl_ips, r["id"])
+-                if not cands:
+-                    self.no_candidate(stats, policy, cc)
+-                c = cands[0]
++                if target_exit_ip is not None:
++                    c = next((x for x in cands if canon_ip(x["exit_ip"]) == target_exit_ip and
++                              ("proxy_id" not in b or x["proxy_id"] == b["proxy_id"])), None)
++                    if c is None:
++                        raise ApiError(409, "CANDIDATE_INELIGIBLE", "指定的出口现在不符合条件,重新预览",
++                                       details={"target_exit_ip": target_exit_ip, "excluded": stats})
++                else:
++                    if not cands:
++                        self.no_candidate(stats, policy, cc)
++                    c = cands[0]
+             n = self.node(pid(c["proxy_id"], "px"))
+             ver, now = r["version"] + 1, int(time.time())
+             self.db.run("UPDATE assignments SET state = 'active', hold = NULL, node_id = ?, exit_ip = ?, version = ?, updated = ?"

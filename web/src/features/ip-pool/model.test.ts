@@ -4,9 +4,11 @@ import {
   deletionLabel,
   formatDistance,
   incidentTime,
+  normalizeTargetExitIp,
   poolActions,
   poolManaged,
   poolExitSummary,
+  poolTargetAction,
   type IpPoolView,
 } from './model'
 
@@ -91,6 +93,53 @@ describe('IP pool card exit summary', () => {
 })
 
 describe('IP pool account actions', () => {
+  it('targets an IP using allocation before assignment and replacement after verified application', () => {
+    const unassigned: IpPoolView = {
+      configured: true,
+      vm_id: 'account-1',
+      state: 'unassigned',
+    }
+    expect(poolTargetAction(unassigned)).toBe('assign')
+    expect(poolTargetAction({ ...unassigned, state: 'released' })).toBe(
+      'assign'
+    )
+    expect(poolTargetAction(applied)).toBe('replace')
+    expect(poolTargetAction({ ...unassigned, configured: false })).toBeNull()
+  })
+
+  it('does not let targeted allocation bypass a login lock, unknown result, ban or active operation', () => {
+    const blocked: IpPoolView[] = [
+      { ...applied, state: 'login_locked', login_locked: true },
+      { configured: true, vm_id: 'account-1', state: 'pending' },
+      { ...applied, state: 'pending' },
+      { ...applied, state: 'blacklisted' },
+      {
+        ...applied,
+        state: 'error',
+        error: { code: 'EXIT_MISMATCH', message: '出口不符' },
+      },
+      {
+        ...applied,
+        operation: { id: 'op-1', type: 'replace', phase: 'draining' },
+      },
+      {
+        configured: true,
+        vm_id: 'account-1',
+        state: 'unassigned',
+        operation: { id: 'op-1', type: 'assign', phase: 'running' },
+      },
+    ]
+    for (const view of blocked) expect(poolTargetAction(view)).toBeNull()
+    expect(
+      poolTargetAction({
+        configured: true,
+        vm_id: 'account-1',
+        state: 'error',
+        error: { code: 'ASSIGNMENT_MISSING', message: '分配不存在' },
+      })
+    ).toBe('assign')
+  })
+
   it('protects the login IP while still allowing verification, copying and ending login', () => {
     const view: IpPoolView = {
       ...applied,
@@ -199,6 +248,37 @@ describe('IP pool account actions', () => {
         error: { code: 'TIMEOUT', message: '操作结果未知' },
       })['retry-deletion']
     ).toBe(true)
+  })
+})
+
+describe('IP pool targeted IP input', () => {
+  it('trims surrounding whitespace and accepts canonical IPv4 and IPv6 addresses', () => {
+    expect(normalizeTargetExitIp(' \t203.0.113.9\n')).toBe('203.0.113.9')
+    expect(normalizeTargetExitIp('2001:DB8:0:0:0:0:0:9')).toBe('2001:db8::9')
+    expect(normalizeTargetExitIp(' \n::ffff:192.0.2.1\t')).toBe(
+      '::ffff:c000:201'
+    )
+  })
+
+  it('rejects empty, malformed, hostname, port, URL and scoped addresses', () => {
+    for (const value of [
+      '',
+      ' \n\t',
+      '256.0.0.1',
+      '1.2.3',
+      '001.2.3.4',
+      '203.0. 113.9',
+      'proxy.example.com',
+      '203.0.113.9:1080',
+      '[2001:db8::9]:1080',
+      '[2001:db8::9]',
+      'https://203.0.113.9',
+      'socks5://203.0.113.9:1080',
+      'fe80::1%eth0',
+      '2001:db8:::9',
+    ]) {
+      expect(normalizeTargetExitIp(value), value).toBeNull()
+    }
   })
 })
 

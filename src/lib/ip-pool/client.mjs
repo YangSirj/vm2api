@@ -9,7 +9,7 @@ const MESSAGES = {
   INVALID_STATE: 'IP 分配当前状态不允许此操作。',
   EGRESS_BLACKLISTED: '此出口已被标黑。',
   NO_ELIGIBLE_PROXY: '暂无符合条件的可用出口。',
-  CANDIDATE_INELIGIBLE: '所选出口已不符合条件，请重新查询候选。',
+  CANDIDATE_INELIGIBLE: '所选出口当前不可分配，可能已被占用、冷却、失效或不符合分配策略。',
   CURSOR_EXPIRED: 'IP 池事件游标已过期，需要重新对账。',
   GEO_UNKNOWN: '无法确定出口位置。',
   UNSUPPORTED_PROTOCOL: 'IP 池不支持所选协议。',

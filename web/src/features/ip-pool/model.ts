@@ -1,3 +1,5 @@
+import { ipv4, ipv6 } from 'zod'
+
 export type IpPoolState =
   | 'unassigned'
   | 'applied'
@@ -181,6 +183,28 @@ export function poolOperationBusy(view: IpPoolView) {
       'queued',
     ].includes(view.operation.phase)
   )
+}
+
+/** 指定出口沿用普通分配/换绑的权限，不绕过登录锁或未决操作。 */
+export function poolTargetAction(
+  view: IpPoolView
+): 'assign' | 'replace' | null {
+  if (poolOperationBusy(view)) return null
+  const actions = poolActions(view)
+  if (actions.assign) return 'assign'
+  if (actions.replace) return 'replace'
+  return null
+}
+
+const targetIpv4 = ipv4()
+const targetIpv6 = ipv6()
+
+export function normalizeTargetExitIp(value: string): string | null {
+  const ip = value.trim()
+  if (targetIpv4.safeParse(ip).success) return ip
+  if (targetIpv6.safeParse(ip).success)
+    return new URL(`http://[${ip}]/`).hostname.slice(1, -1)
+  return null
 }
 
 export function formatAnchor(anchor: IpPoolAnchor | string | null | undefined) {

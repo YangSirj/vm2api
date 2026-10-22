@@ -6,6 +6,9 @@ import { loadIpPoolState, saveIpPoolState } from './state.mjs'
 const MESSAGES = {
   INVALID_ACTION: '不支持此 IP 管理操作。',
   INVALID_VM: '账号槽位编号不正确。',
+  INVALID_TARGET_EXIT_IP: '请输入有效的公网 IP 地址，不要填写链接、域名或端口。',
+  TARGET_EXIT_IP_MISMATCH: '上游分配与指定公网 IP 不一致，保持暂停，请核查 IP 池。',
+  EXACT_EXIT_UNSUPPORTED: 'IP 池尚未支持指定公网 IP，请先更新 IP 池。',
   BUSY: '此账号正在处理 IP 操作，请等待完成。',
   LOGIN_LOCKED: '登录期间已锁定出口，请先完成登录并解除锁定。',
   BLACKLISTED: '此账号已确认封禁，保持停用。',
@@ -55,6 +58,12 @@ function safeError(error) {
 
 const copy = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
 const now = () => new Date().toISOString()
+
+function canonicalIp(value) {
+  if (typeof value !== 'string' || !isIP(value.trim())) throw failure('INVALID_TARGET_EXIT_IP', 400)
+  const ip = value.trim()
+  return isIP(ip) === 6 ? new URL(`http://[${ip}]/`).hostname.slice(1, -1) : ip
+}
 
 function select(source, fields) {
   if (!source) return null
@@ -327,7 +336,10 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
       entry.pending_mutation = null
       return result
     } catch (error) {
-      if (!error?.outcomeUnknown) entry.pending_mutation = null
+      if (!error?.outcomeUnknown) {
+        entry.pending_mutation = null
+        if (type === 'assign' || type === 'replace') delete entry.requested_exit_ip
+      }
       throw error
     }
   }
@@ -338,9 +350,17 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
       found = await client.getAssignment(entry.assignment.assignment_id)
     } else {
       const result = await client.listAssignments(`vm2api:${instanceId}:${entry.vm_id}`)
-      found = result.assignments?.find((item) => item.consumer_ref === `vm2api:${instanceId}:${entry.vm_id}`)
+      if (!Array.isArray(result?.assignments)) throw new IpPoolError('INVALID_RESPONSE')
+      found = result.assignments.find((item) => item.consumer_ref === `vm2api:${instanceId}:${entry.vm_id}`)
     }
-    if (!found) throw failure('ASSIGNMENT_MISSING')
+    if (!found) {
+      if (!entry.assignment && entry.pending_mutation?.type === 'assign') {
+        entry.pending_mutation = null
+        delete entry.requested_exit_ip
+        save()
+      }
+      throw failure('ASSIGNMENT_MISSING')
+    }
     entry.assignment = assignmentRecord(found)
     if (entry.pending_mutation?.type !== 'blacklist') entry.pending_mutation = null
     save()
@@ -367,6 +387,7 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
     await finishHold(entry)
     entry.pending_apply = false
     entry.pending_release = false
+    delete entry.requested_exit_ip
     entry.state = entry.ban_confirmed ? 'blacklisted' : 'released'
   }
 
@@ -375,6 +396,8 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
     save()
     const assignment = entry.assignment
     if (assignment.state === 'released') return releaseLocal(entry)
+    if (entry.requested_exit_ip && canonicalIp(assignment.current_exit_ip) !== entry.requested_exit_ip)
+      throw failure('TARGET_EXIT_IP_MISMATCH')
     if (assignment.state !== 'active') throw failure('ASSIGNMENT_INACTIVE')
     const access = await client.access(assignment.assignment_id, assignment.version)
     if (
@@ -425,12 +448,14 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
     await settle(entry)
     await finishHold(entry)
     entry.pending_apply = false
+    delete entry.requested_exit_ip
     entry.state = entry.login_locked ? 'login_locked' : 'applied'
   }
 
   async function verifyCurrent(entry, { allowErrorRetry = false } = {}) {
     if (
       entry.pending_mutation ||
+      entry.requested_exit_ip ||
       entry.pending_apply ||
       entry.pending_release ||
       entry.previous.length ||
@@ -501,11 +526,26 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
       'retry-deletion',
     ]
     if (!actions.includes(action)) throw failure('INVALID_ACTION', 400)
+    const target =
+      ['assign', 'replace'].includes(action) && Object.hasOwn(body, 'target_exit_ip')
+        ? canonicalIp(body.target_exit_ip)
+        : null
     const entry = entryFor(vmId, true)
     if (active.has(vmId)) throw failure('BUSY')
     if (entry.ban_confirmed && ['assign', 'apply', 'replace', 'login-lock', 'login-unlock', 'access'].includes(action))
       throw failure('BLACKLISTED')
     if (entry.login_locked && ['assign', 'apply', 'replace', 'release'].includes(action)) throw failure('LOGIN_LOCKED')
+    if (entry.requested_exit_ip && ['assign', 'replace'].includes(action)) throw failure('RECONCILE_REQUIRED')
+    if (target) {
+      if (entry.pending_mutation || entry.requested_exit_ip) throw failure('RECONCILE_REQUIRED')
+      const capabilities = await client.capabilities()
+      if (capabilities.features?.exact_exit_ip !== true) throw failure('EXACT_EXIT_UNSUPPORTED')
+      // capabilities is read-only; recheck the per-VM lock after awaiting it.
+      if (active.has(vmId)) throw failure('BUSY')
+      if (entry.ban_confirmed) throw failure('BLACKLISTED')
+      if (entry.login_locked) throw failure('LOGIN_LOCKED')
+      if (entry.pending_mutation || entry.requested_exit_ip) throw failure('RECONCILE_REQUIRED')
+    }
     const evidence = action === 'blacklist' ? banEvidence(entry, body) : null
     active.add(vmId)
     entry.operation = {
@@ -529,11 +569,24 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
       const before = await holdAndDrain(entry)
       if (action === 'assign') {
         if (entry.pending_mutation?.type === 'replace') throw failure('RECONCILE_REQUIRED')
-        if (entry.assignment && entry.assignment.state !== 'released') await reconcile(entry)
-        else {
+        if (entry.assignment && entry.assignment.state !== 'released') {
+          await reconcile(entry)
+          if (target && canonicalIp(entry.assignment.current_exit_ip) !== target) {
+            entry.requested_exit_ip = target
+            save()
+            throw failure('TARGET_EXIT_IP_MISMATCH')
+          }
+          if (target) {
+            await verifyCurrent(entry)
+            await finishHold(entry)
+            entry.state = 'applied'
+          } else await applyAssignment(entry, before)
+        } else {
+          if (target) entry.requested_exit_ip = target
           const result = await mutate(entry, 'assign', () =>
             client.assign({
               consumer_ref: `vm2api:${instanceId}:${vmId}`,
+              ...(target ? { target_exit_ip: target } : {}),
               policy: {
                 exclusive_exit: true,
                 protocols: ['vless'],
@@ -544,8 +597,8 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
           )
           entry.assignment = assignmentRecord(result.assignment)
           save()
+          await applyAssignment(entry, before)
         }
-        await applyAssignment(entry, before)
       } else if (action === 'apply') {
         await reconcile(entry)
         await applyAssignment(entry, before)
@@ -554,17 +607,25 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
         const expected = entry.assignment?.version
         const found = await reconcile(entry)
         if (found.version !== expected) throw failure('ASSIGNMENT_CHANGED')
-        rememberPrevious(entry, before)
-        const result = await mutate(entry, 'replace', () =>
-          client.replace(found.assignment_id, {
-            expected_version: found.version,
-            reason: String(body.reason || 'manual_replacement').slice(0, 80),
-            require_new_exit_ip: true,
-          }),
-        )
-        entry.assignment = assignmentRecord(result.assignment)
-        save()
-        await applyAssignment(entry, before)
+        if (!target || canonicalIp(found.current_exit_ip) !== target) {
+          rememberPrevious(entry, before)
+          if (target) entry.requested_exit_ip = target
+          const result = await mutate(entry, 'replace', () =>
+            client.replace(found.assignment_id, {
+              expected_version: found.version,
+              reason: String(body.reason || 'manual_replacement').slice(0, 80),
+              require_new_exit_ip: true,
+              ...(target ? { target_exit_ip: target } : {}),
+            }),
+          )
+          entry.assignment = assignmentRecord(result.assignment)
+          save()
+          await applyAssignment(entry, before)
+        } else {
+          await verifyCurrent(entry)
+          await finishHold(entry)
+          entry.state = 'applied'
+        }
       } else if (action === 'release') {
         if (entry.assignment || entry.pending_mutation) await reconcile(entry)
         if (entry.assignment?.state !== 'released' && entry.assignment) {

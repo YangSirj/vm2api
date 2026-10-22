@@ -41,6 +41,10 @@ async function fixture(t) {
     bridges: new Map(),
   }
   const client = {
+    async capabilities() {
+      log.push(['capabilities'])
+      return { features: { exact_exit_ip: true } }
+    },
     async assign(body) {
       log.push(['assign', clone(body)])
       env.assignment ||= {
@@ -219,6 +223,170 @@ async function fixture(t) {
 }
 
 const calls = (fixture, name) => fixture.log.filter((item) => item[0] === name)
+
+test('exact IP allocation and replacement send the canonical target and verify it before restoring', async (t) => {
+  const f = await fixture(t)
+  let result = await f.service.execute(VM, 'assign', { target_exit_ip: ` ${FIRST} ` })
+  assert.equal(result.state, 'applied')
+  assert.equal(calls(f, 'assign')[0][1].target_exit_ip, FIRST)
+  assert.equal(loadIpPoolState(f.stateFile).vms[VM].requested_exit_ip, undefined)
+  result = await f.service.execute(VM, 'replace', { target_exit_ip: SECOND })
+  assert.equal(result.state, 'applied')
+  assert.equal(result.applied.exit_ip, SECOND)
+  assert.equal(calls(f, 'replace')[0][2].target_exit_ip, SECOND)
+  assert.equal(f.env.marker, null)
+  const count = calls(f, 'start').length
+  const version = result.assignment.version
+  result = await f.service.execute(VM, 'replace', { target_exit_ip: SECOND })
+  assert.equal(result.state, 'applied')
+  assert.equal(result.assignment.version, version)
+  assert.equal(calls(f, 'replace').length, 1)
+  assert.equal(calls(f, 'start').length, count, 'same target only verifies the existing binding')
+  assert.equal((await f.service.execute(VM, 'assign', { target_exit_ip: SECOND })).state, 'applied')
+  assert.equal(calls(f, 'assign').length, 1)
+  assert.equal(calls(f, 'start').length, count, 'same target assign also leaves the existing binding intact')
+})
+
+test('invalid target and unsupported upstream fail before maintenance or allocation', async (t) => {
+  const f = await fixture(t)
+  for (const target of ['', null, 42, 'example.com', '1.2.3.4:80', 'http://1.2.3.4', '[2606:4700::1111]']) {
+    await assert.rejects(f.service.execute(VM, 'assign', { target_exit_ip: target }), {
+      code: 'INVALID_TARGET_EXIT_IP',
+    })
+  }
+  f.client.capabilities = async () => ({ features: {} })
+  await assert.rejects(f.service.execute(VM, 'assign', { target_exit_ip: FIRST }), {
+    code: 'EXACT_EXIT_UNSUPPORTED',
+  })
+  assert.equal(f.log.length, 0)
+  assert.equal(f.env.marker, null)
+})
+
+test('IPv6 exact targets use canonical form across allocation and returned-address comparison', async (t) => {
+  const f = await fixture(t)
+  const assign = f.client.assign
+  f.client.assign = async (body) => {
+    await assign(body)
+    f.env.assignment.current_exit_ip = '2606:4700:0:0:0:0:0:1111'
+    return { assignment: clone(f.env.assignment) }
+  }
+  const result = await f.service.execute(VM, 'assign', { target_exit_ip: '2606:4700:0:0::1111' })
+  assert.equal(result.state, 'applied')
+  assert.equal(calls(f, 'assign')[0][1].target_exit_ip, '2606:4700::1111')
+})
+
+test('unavailable exact target never falls back to automatic allocation', async (t) => {
+  const f = await fixture(t)
+  f.client.assign = async (body) => {
+    f.log.push(['assign', clone(body)])
+    throw new IpPoolError('CANDIDATE_INELIGIBLE', { status: 409 })
+  }
+  const result = await f.service.execute(VM, 'assign', { target_exit_ip: SECOND })
+  assert.equal(result.error.code, 'CANDIDATE_INELIGIBLE')
+  assert.equal(calls(f, 'assign').length, 1)
+  assert.equal(calls(f, 'start').length, 0)
+  assert.equal(result.assignment, null)
+  assert.equal(loadIpPoolState(f.stateFile).vms[VM].requested_exit_ip, undefined)
+})
+
+test('a wrong exact allocation is never applied, including after a restart and reconciliation', async (t) => {
+  const f = await fixture(t)
+  const result = await f.service.execute(VM, 'assign', { target_exit_ip: SECOND })
+  assert.equal(result.error.code, 'TARGET_EXIT_IP_MISMATCH')
+  assert.equal(calls(f, 'access').length, 0)
+  assert.equal(calls(f, 'start').length, 0)
+  assert.ok(f.env.marker)
+  const service = f.create()
+  assert.equal((await service.execute(VM, 'apply')).error.code, 'TARGET_EXIT_IP_MISMATCH')
+  for (const action of ['assign', 'replace']) {
+    await assert.rejects(service.execute(VM, action), { code: 'RECONCILE_REQUIRED' })
+  }
+  assert.equal(calls(f, 'assign').length, 1)
+  assert.equal(calls(f, 'restore').length, 0)
+  assert.equal((await service.execute(VM, 'release')).state, 'released')
+  assert.equal(loadIpPoolState(f.stateFile).vms[VM].requested_exit_ip, undefined)
+})
+
+test('an existing assignment cannot silently satisfy a different exact allocation target', async (t) => {
+  const f = await fixture(t)
+  await f.service.execute(VM, 'assign')
+  const starts = calls(f, 'start').length
+  assert.equal(
+    (await f.service.execute(VM, 'assign', { target_exit_ip: SECOND })).error.code,
+    'TARGET_EXIT_IP_MISMATCH',
+  )
+  assert.equal((await f.create().execute(VM, 'apply')).error.code, 'TARGET_EXIT_IP_MISMATCH')
+  assert.equal(calls(f, 'start').length, starts)
+  assert.equal(calls(f, 'assign').length, 1)
+  assert.ok(f.env.marker)
+})
+
+test('an unknown exact replacement retains the target and is reconciled without replay', async (t) => {
+  const f = await fixture(t)
+  await f.service.execute(VM, 'assign')
+  const replace = f.client.replace
+  f.client.replace = async (id, body) => {
+    await replace(id, body)
+    throw new IpPoolError('TIMEOUT', { outcomeUnknown: true })
+  }
+  assert.equal((await f.service.execute(VM, 'replace', { target_exit_ip: SECOND })).state, 'pending')
+  const service = f.create()
+  await assert.rejects(service.execute(VM, 'replace', { target_exit_ip: SECOND }), { code: 'RECONCILE_REQUIRED' })
+  assert.equal((await service.execute(VM, 'apply')).applied.exit_ip, SECOND)
+  assert.equal(calls(f, 'replace').length, 1)
+  assert.equal(f.env.marker, null)
+})
+
+test('target selection cannot bypass a login lock created during the capability query', async (t) => {
+  const f = await fixture(t)
+  await f.service.execute(VM, 'assign')
+  f.client.capabilities = async () => {
+    await f.service.execute(VM, 'login-lock')
+    return { features: { exact_exit_ip: true } }
+  }
+  await assert.rejects(f.service.execute(VM, 'replace', { target_exit_ip: SECOND }), { code: 'LOGIN_LOCKED' })
+  assert.equal(calls(f, 'replace').length, 0)
+})
+
+test('an exact allocation timeout with confirmed absence permits a later explicit allocation', async (t) => {
+  const f = await fixture(t)
+  const assign = f.client.assign
+  f.client.assign = async () => {
+    throw new IpPoolError('TIMEOUT', { outcomeUnknown: true })
+  }
+  assert.equal((await f.service.execute(VM, 'assign', { target_exit_ip: FIRST })).state, 'pending')
+  assert.equal((await f.service.execute(VM, 'apply')).error.code, 'ASSIGNMENT_MISSING')
+  assert.equal(loadIpPoolState(f.stateFile).vms[VM].requested_exit_ip, undefined)
+  f.client.assign = assign
+  assert.equal((await f.service.execute(VM, 'assign', { target_exit_ip: FIRST })).state, 'applied')
+})
+
+test('a malformed assignment list preserves an unknown exact allocation and its target after restart', async (t) => {
+  const f = await fixture(t)
+  f.client.assign = async (body) => {
+    f.log.push(['assign', clone(body)])
+    throw new IpPoolError('TIMEOUT', { outcomeUnknown: true })
+  }
+  assert.equal((await f.service.execute(VM, 'assign', { target_exit_ip: FIRST })).state, 'pending')
+  const service = f.create()
+  for (const response of [null, {}, { assignments: null }, { assignments: {} }]) {
+    f.client.listAssignments = async () => response
+    const result = await service.execute(VM, 'apply')
+    assert.equal(result.error.code, 'INVALID_RESPONSE')
+    assert.equal(result.state, 'pending')
+    const entry = loadIpPoolState(f.stateFile).vms[VM]
+    assert.equal(entry.pending_mutation.type, 'assign')
+    assert.equal(entry.requested_exit_ip, FIRST)
+    assert.ok(f.env.marker)
+    await assert.rejects(service.execute(VM, 'assign', { target_exit_ip: SECOND }), {
+      code: 'RECONCILE_REQUIRED',
+    })
+  }
+  assert.equal(calls(f, 'assign').length, 1)
+  assert.equal(calls(f, 'access').length, 0)
+  assert.equal(calls(f, 'start').length, 0)
+  assert.equal(calls(f, 'restore').length, 0)
+})
 
 test('assign holds and drains before allocation, verifies before restoring, and persists no access credentials', async (t) => {
   const f = await fixture(t)
