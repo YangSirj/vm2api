@@ -23,7 +23,7 @@ export function LoginPage() {
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
-  const [base, setBase] = useState(apiBase())
+  const [base, setBase] = useState(apiBase() || location.origin)
   const [error, setError] = useState('')
   const [pending, setPending] = useState(false)
   const hideBase = sameOriginPanel()
@@ -167,7 +167,7 @@ export function LoginPage() {
                 <Label htmlFor='login-api-base'>API Base</Label>
                 <Input
                   id='login-api-base'
-                  placeholder='http://127.0.0.1:8787'
+                  placeholder={location.origin}
                   className='h-10 rounded-lg'
                   value={base}
                   onChange={(e) => setBase(e.target.value)}
