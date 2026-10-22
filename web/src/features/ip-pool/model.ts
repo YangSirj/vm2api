@@ -20,6 +20,24 @@ export type IpPoolAnchor = {
   longitude?: number
 }
 
+export type IpPoolCandidate = {
+  proxy_id: string
+  exit_ip: string
+  country_code?: string
+  region?: string
+  city?: string
+  distance_km?: number | null
+  quality_score?: number | null
+  latency_ms?: number | null
+  health_status?: string
+}
+
+export type IpPoolCandidates = {
+  candidates: IpPoolCandidate[]
+  complete: boolean
+  fetched_at: string
+}
+
 export type IpPoolView = {
   configured: boolean
   vm_id: string

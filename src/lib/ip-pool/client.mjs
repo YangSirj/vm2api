@@ -125,7 +125,8 @@ export class IpPoolClient {
       throw new IpPoolError('KEY_UNAVAILABLE')
     }
 
-    const mutation = method !== 'GET'
+    // Candidate selection is a read-only query even though its filters use a POST body.
+    const mutation = method !== 'GET' && !(method === 'POST' && url.pathname === '/api/v1/candidates')
     const controller = new AbortController()
     let timer
     const deadline = new Promise((_, reject) => {
@@ -187,6 +188,10 @@ export class IpPoolClient {
 
   async getAssignment(id) {
     return (await this.request('GET', `/assignments/${resourceId(id, 'asg')}`)).data
+  }
+
+  async candidates(body) {
+    return (await this.request('POST', '/candidates', body)).data
   }
 
   async assign(body) {

@@ -17,6 +17,7 @@
 | GET  | `/capabilities`                  | `api_version, client_id, features, events, limits`                                                                                                             |
 | GET  | `/assignments?consumer_ref=...`  | `data.assignments[]`                                                                                                                                           |
 | GET  | `/assignments/{id}`              | `data` 直接是分配对象                                                                                                                                          |
+| POST | `/candidates`                    | 只读预览；`assignment_id?, policy?, require_new_exit_ip?, exclude_proxy_ids?, limit?`，每次最多 50 条；返回 `candidates, eligible_count`                       |
 | POST | `/assignments`                   | `consumer_ref, consumer_label?, anchor_ip?/anchor?, policy?`；返回 `{assignment, created, selection?}`                                                         |
 | POST | `/assignments/{id}/access`       | `expected_version`；返回 `version, proxy_id, expected_exit_ip, fields, uri`                                                                                    |
 | POST | `/assignments/{id}/replacements` | `expected_version, reason?, proxy_id?, require_new_exit_ip?, exclude_proxy_ids?, exclude_exit_ips?`；返回 `{assignment, previous, selection}`，随后另取 access |
@@ -28,6 +29,12 @@
 | POST | `/blacklist/{id}/retry-deletion` | 返回更新后的黑名单状态                                                                                                                                         |
 
 分配对象的关键字段为 `assignment_id, consumer_ref, state, hold, version, current_proxy_id, current_exit_ip, anchor, policy`。`state` 为 `active/paused/released`。服务器的 active 只表示已分配，不能据此判断 vm2api 已应用或可调度。
+
+## 面板候选预览
+
+管理员可查询 `GET /api/panel/ip-pool/vms/{vmId}/candidates`，返回 `{ok:true,data:{candidates,complete,fetched_at}}`，并使用 `Cache-Control: no-store`。候选只含 `proxy_id, exit_ip, country_code, region, city, distance_km, quality_score, latency_ms, health_status` 元数据，不返回连接凭据。
+
+服务按账号分配上下文查询上游候选，每页排除已读节点，按公网 IP 去重。`complete=true` 表示已遍历此次查询中的候选，`false` 表示部分结果；查询过程不具备库存快照或预留语义。真正分配仍由上游原子检查目标资格。此 POST 是只读查询，失败不会被记作未决写操作，也不会改变账号暂停或本地分配状态。
 
 ## 版本与幂等
 

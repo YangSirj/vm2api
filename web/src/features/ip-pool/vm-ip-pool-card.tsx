@@ -349,7 +349,8 @@ export function VmIpPoolCard({
       </CardContent>
       {confirm && view ? (
         <ConfirmPoolAction
-          key={`${confirm.kind}:${Boolean(confirm.targeted)}`}
+          key={`${vmId}:${confirm.kind}:${Boolean(confirm.targeted)}`}
+          vmId={vmId}
           kind={confirm.kind}
           targeted={confirm.targeted}
           exitIp={

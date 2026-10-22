@@ -224,6 +224,260 @@ async function fixture(t) {
 
 const calls = (fixture, name) => fixture.log.filter((item) => item[0] === name)
 
+const candidate = (id, extra = {}) => ({
+  proxy_id: `px_${id}`,
+  exit_ip: `198.51.100.${id}`,
+  country_code: 'US',
+  region: 'California',
+  city: 'Los Angeles',
+  distance_km: 12,
+  quality_score: 90,
+  latency_ms: 180,
+  health_status: 'healthy',
+  ...extra,
+})
+
+test('candidate listing traverses over 50 nodes, excludes every visited proxy and deduplicates canonical exits', async (t) => {
+  const f = await fixture(t)
+  const inventory = Array.from({ length: 120 }, (_, index) => candidate(index + 1))
+  inventory.push(candidate(121, { exit_ip: '2001:db8::1' }))
+  inventory.push(candidate(122, { exit_ip: '2001:0db8:0:0:0:0:0:1' }))
+  Object.assign(inventory[0], { uri: `vless://${SECRET}`, fields: { uuid: SECRET }, nested: { secret: SECRET } })
+  Object.assign(inventory[1], { region: { secret: SECRET }, city: [SECRET], latency_ms: { secret: SECRET } })
+  f.client.candidates = async (body) => {
+    f.log.push(['candidates', clone(body)])
+    const remaining = inventory.filter((item) => !body.exclude_proxy_ids.includes(item.proxy_id))
+    return { candidates: clone(remaining.slice(0, body.limit)), eligible_count: remaining.length }
+  }
+  const result = await f.service.candidates(VM)
+  assert.equal(result.complete, true)
+  assert.equal(result.candidates.length, 121)
+  assert.deepEqual(
+    result.candidates.map((item) => item.exit_ip),
+    inventory.slice(0, 121).map((item) => item.exit_ip),
+  )
+  assert.match(result.fetched_at, /^\d{4}-\d\d-\d\dT.*Z$/)
+  assert.equal(calls(f, 'candidates').length, 3)
+  for (const [index, [, body]] of calls(f, 'candidates').entries()) {
+    assert.equal(body.limit, 50)
+    assert.deepEqual(
+      body.exclude_proxy_ids,
+      inventory.slice(0, index * 50).map((item) => item.proxy_id),
+    )
+  }
+  assert.deepEqual(Object.keys(result.candidates[0]).sort(), [
+    'city',
+    'country_code',
+    'distance_km',
+    'exit_ip',
+    'health_status',
+    'latency_ms',
+    'proxy_id',
+    'quality_score',
+    'region',
+  ])
+  assert.equal(result.candidates[1].region, null)
+  assert.equal(result.candidates[1].city, null)
+  assert.equal(result.candidates[1].latency_ms, null)
+  assert.equal(JSON.stringify(result).includes(SECRET), false)
+  assert.deepEqual(
+    f.log.map(([name]) => name),
+    ['list', 'candidates', 'candidates', 'candidates'],
+  )
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' })
+})
+
+test('candidate short pages continue when eligible_count says more remain', async (t) => {
+  const f = await fixture(t)
+  const requests = []
+  f.client.candidates = async (body) => {
+    requests.push(clone(body))
+    return requests.length === 1
+      ? { candidates: [candidate(1)], eligible_count: 2 }
+      : { candidates: [candidate(2)], eligible_count: 1 }
+  }
+  assert.equal((await f.service.candidates(VM)).complete, true)
+  assert.equal(requests.length, 2)
+  assert.deepEqual(requests[1].exclude_proxy_ids, ['px_1'])
+})
+
+test('candidate traversal reports incomplete when the pool ignores exclusions or the finite page cap is reached', async (t) => {
+  const f = await fixture(t)
+  let requests = 0
+  f.client.candidates = async () => {
+    requests += 1
+    return { candidates: [candidate(1)], eligible_count: 2 }
+  }
+  let result = await f.service.candidates(VM)
+  assert.equal(result.complete, false)
+  assert.equal(result.candidates.length, 1)
+  assert.equal(requests, 2)
+  requests = 0
+  f.client.candidates = async (body) => {
+    requests += 1
+    assert.equal(body.exclude_proxy_ids.length, requests - 1)
+    return { candidates: [candidate(requests)], eligible_count: 2 }
+  }
+  result = await f.service.candidates(VM)
+  assert.equal(result.complete, false)
+  assert.equal(requests, 100)
+  assert.equal(result.candidates.length, 100)
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' })
+})
+
+test('candidate listing handles empty inventories and an explicit end after a full page', async (t) => {
+  const f = await fixture(t)
+  f.client.candidates = async () => ({ candidates: [], eligible_count: 0 })
+  assert.deepEqual((await f.service.candidates(VM)).candidates, [])
+  assert.equal((await f.service.candidates(VM)).complete, true)
+  f.client.candidates = async () => {
+    throw new IpPoolError('NO_ELIGIBLE_PROXY', { status: 409 })
+  }
+  assert.equal((await f.service.candidates(VM)).complete, true)
+  let requests = 0
+  f.client.candidates = async () => {
+    requests += 1
+    if (requests === 1) return { candidates: Array.from({ length: 50 }, (_, index) => candidate(index + 1)) }
+    throw new IpPoolError('NO_ELIGIBLE_PROXY', { status: 409 })
+  }
+  const result = await f.service.candidates(VM)
+  assert.equal(result.candidates.length, 50)
+  assert.equal(result.complete, true)
+  assert.equal(requests, 2)
+})
+
+test('candidate previews use the initial assign policy and find a preexisting stable upstream consumer without local writes', async (t) => {
+  const f = await fixture(t)
+  let request
+  f.client.candidates = async (body) => {
+    request = clone(body)
+    return { candidates: [] }
+  }
+  await f.service.candidates(VM)
+  assert.deepEqual(request, {
+    policy: { exclusive_exit: true, protocols: ['vless'], same_country_required: true, settle_grace_seconds: 900 },
+    require_new_exit_ip: false,
+    limit: 50,
+    exclude_proxy_ids: [],
+  })
+  f.env.assignment = {
+    assignment_id: 'asg_9',
+    version: 8,
+    state: 'active',
+    consumer_ref: 'vm2api:test-host:vm-01',
+    anchor: { exit_ip: FIRST, country_code: 'US', latitude: 34, longitude: -118 },
+    policy: { exclusive_exit: true, max_distance_km: 40, min_quality_score: 80 },
+  }
+  await f.service.candidates(VM)
+  assert.deepEqual(request, { assignment_id: 'asg_9', require_new_exit_ip: false, limit: 50, exclude_proxy_ids: [] })
+  assert.deepEqual(
+    calls(f, 'list').map(([, ref]) => ref),
+    ['vm2api:test-host:vm-01', 'vm2api:test-host:vm-01'],
+  )
+  assert.equal(f.service.view(VM).state, 'unassigned')
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' })
+})
+
+test('candidate preview reads latest assignment context while preserving pending state and existing holds byte for byte', async (t) => {
+  const f = await fixture(t)
+  await f.service.execute(VM, 'assign')
+  const stored = loadIpPoolState(f.stateFile)
+  stored.vms[VM].state = 'pending'
+  stored.vms[VM].maintenance_id = 'preexisting-hold'
+  stored.vms[VM].login_locked = true
+  stored.vms[VM].error = { code: 'ASSIGNMENT_CHANGED', message: 'preexisting review' }
+  saveIpPoolState(f.stateFile, stored)
+  f.service.close()
+  const service = f.create()
+  f.env.marker = 'preexisting-hold'
+  f.env.assignment = {
+    ...f.env.assignment,
+    version: 10,
+    policy: { min_quality_score: 95 },
+    anchor: { exit_ip: SECOND },
+  }
+  let request
+  f.client.candidates = async (body) => {
+    f.log.push(['candidates'])
+    request = clone(body)
+    return { candidates: [] }
+  }
+  f.log.length = 0
+  const beforeFile = await readFile(f.stateFile, 'utf8')
+  const beforeStat = await stat(f.stateFile)
+  const beforeView = service.view(VM)
+  await service.candidates(VM)
+  assert.deepEqual(request, { assignment_id: 'asg_1', require_new_exit_ip: false, limit: 50, exclude_proxy_ids: [] })
+  assert.deepEqual(service.view(VM), beforeView)
+  assert.equal(await readFile(f.stateFile, 'utf8'), beforeFile)
+  assert.equal((await stat(f.stateFile)).mtimeMs, beforeStat.mtimeMs)
+  assert.equal(f.env.marker, 'preexisting-hold')
+  assert.deepEqual(f.log, [['get', 'asg_1'], ['candidates']])
+  f.env.assignment = { ...f.env.assignment, state: 'released', current_exit_ip: FIRST }
+  await service.candidates(VM)
+  assert.equal(Object.hasOwn(request, 'assignment_id'), false)
+  assert.deepEqual(request.anchor, { exit_ip: SECOND })
+  assert.deepEqual(request.policy, {
+    exclusive_exit: true,
+    protocols: ['vless'],
+    same_country_required: true,
+    settle_grace_seconds: 900,
+  })
+  assert.equal(request.require_new_exit_ip, false)
+  assert.equal(Object.hasOwn(request, 'exclude_exit_ips'), false)
+  assert.deepEqual(service.view(VM), beforeView)
+  assert.equal(await readFile(f.stateFile, 'utf8'), beforeFile)
+  assert.equal(f.env.marker, 'preexisting-hold')
+})
+
+test('candidate query errors never return cached or partial results and never create or change state or holds', async (t) => {
+  const f = await fixture(t)
+  f.client.candidates = async () => ({ candidates: [candidate(1)] })
+  assert.equal((await f.service.candidates(VM)).candidates.length, 1)
+  f.client.candidates = async () => {
+    throw new IpPoolError('UNAUTHENTICATED', { status: 401 })
+  }
+  await assert.rejects(f.service.candidates(VM), { code: 'UNAUTHENTICATED' })
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' })
+  await f.service.execute(VM, 'assign')
+  const beforeFile = await readFile(f.stateFile, 'utf8')
+  const beforeView = f.service.view(VM)
+  const beforeHold = f.env.marker
+  f.log.length = 0
+  let requests = 0
+  f.client.candidates = async () => {
+    requests += 1
+    if (requests === 1) return { candidates: [candidate(1)], eligible_count: 2 }
+    throw new IpPoolError('NETWORK_ERROR')
+  }
+  await assert.rejects(f.service.candidates(VM), { code: 'NETWORK_ERROR' })
+  assert.equal(requests, 2)
+  assert.deepEqual(f.service.view(VM), beforeView)
+  assert.equal(await readFile(f.stateFile, 'utf8'), beforeFile)
+  assert.equal(f.env.marker, beforeHold)
+  assert.deepEqual(f.log, [['get', 'asg_1']])
+})
+
+test('invalid candidate records and assignment queries fail without state writes', async (t) => {
+  const f = await fixture(t)
+  for (const response of [
+    null,
+    { candidates: {} },
+    { candidates: [candidate(1, { exit_ip: 'not-an-ip' })] },
+    { candidates: [candidate(1, { proxy_id: { secret: SECRET } })] },
+  ]) {
+    f.client.candidates = async () => response
+    await assert.rejects(f.service.candidates(VM), { code: 'INVALID_RESPONSE' })
+  }
+  f.client.listAssignments = async () => ({ assignments: null })
+  await assert.rejects(f.service.candidates(VM), { code: 'INVALID_RESPONSE' })
+  await assert.rejects(readFile(f.stateFile), { code: 'ENOENT' })
+  assert.equal(f.env.marker, null)
+  await assert.rejects(f.service.candidates('../invalid'), { code: 'INVALID_VM' })
+  f.service.close()
+  await assert.rejects(f.service.candidates(VM), { code: 'CLOSED' })
+})
+
 test('exact IP allocation and replacement send the canonical target and verify it before restoring', async (t) => {
   const f = await fixture(t)
   let result = await f.service.execute(VM, 'assign', { target_exit_ip: ` ${FIRST} ` })

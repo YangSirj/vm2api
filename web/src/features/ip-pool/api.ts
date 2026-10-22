@@ -1,5 +1,6 @@
+import { queryOptions } from '@tanstack/react-query'
 import { api, isApiError } from '@/lib/api'
-import type { IpPoolAction, IpPoolView } from './model'
+import type { IpPoolAction, IpPoolCandidates, IpPoolView } from './model'
 
 export function poolPath(vmId: string) {
   return `/api/panel/ip-pool/vms/${encodeURIComponent(vmId)}`
@@ -7,6 +8,18 @@ export function poolPath(vmId: string) {
 
 export function poolQueryKey(vmId: string) {
   return ['panel', 'ip-pool', vmId] as const
+}
+
+export function poolCandidatesQueryOptions(vmId: string) {
+  return queryOptions({
+    queryKey: [...poolQueryKey(vmId), 'candidates'] as const,
+    queryFn: ({ signal }) =>
+      api<IpPoolCandidates>(`${poolPath(vmId)}/candidates`, { signal }),
+    retry: false,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
 }
 
 export async function readPool(vmId: string, signal?: AbortSignal) {

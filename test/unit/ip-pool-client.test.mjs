@@ -35,6 +35,12 @@ test('pool wrappers send the documented paths, JSON bodies and safe HTTP options
     [() => client.listAssignments('vm2api:account / 1'), 'GET', '/assignments?consumer_ref=vm2api%3Aaccount+%2F+1'],
     [() => client.getAssignment('asg_12'), 'GET', '/assignments/asg_12'],
     [
+      () => client.candidates({ assignment_id: 'asg_12', limit: 50, exclude_proxy_ids: ['px_1'] }),
+      'POST',
+      '/candidates',
+      { assignment_id: 'asg_12', limit: 50, exclude_proxy_ids: ['px_1'] },
+    ],
+    [
       () => client.assign({ consumer_ref: 'account-1', policy: { exclusive_exit: true } }),
       'POST',
       '/assignments',
@@ -201,6 +207,44 @@ test('invalid responses are not treated as successful writes, and reads are not 
     assert.equal(error.outcomeUnknown, false)
     return true
   })
+})
+
+test('candidate POST failures remain read-only for timeout, network, invalid response and upstream errors', async (t) => {
+  const scenarios = [
+    ['TIMEOUT', () => new Promise(() => {})],
+    [
+      'NETWORK_ERROR',
+      async () => {
+        throw new Error(TEST_KEY)
+      },
+    ],
+    ['INVALID_RESPONSE', async () => new Response('not json')],
+    ['INVALID_RESPONSE', async () => new Response(JSON.stringify({ data: [] }))],
+    [
+      'INTERNAL',
+      async () =>
+        new Response(JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: TEST_KEY } }), { status: 500 }),
+    ],
+  ]
+  for (const [code, respond] of scenarios) {
+    let calls = 0
+    const { client } = await fixture(
+      t,
+      (...args) => {
+        calls += 1
+        return respond(...args)
+      },
+      { timeoutMs: 15 },
+    )
+    await assert.rejects(client.candidates({ limit: 50 }), (error) => {
+      assert.ok(error instanceof IpPoolError)
+      assert.equal(error.code, code)
+      assert.equal(error.outcomeUnknown, false)
+      assert.equal(`${error.stack}${JSON.stringify(error)}`.includes(TEST_KEY), false)
+      return true
+    })
+    assert.equal(calls, 1)
+  }
 })
 
 test('invalid key files, non-HTTPS URLs and paths outside the API are rejected before sending', async (t) => {

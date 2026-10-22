@@ -58,6 +58,12 @@ function safeError(error) {
 
 const copy = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)))
 const now = () => new Date().toISOString()
+const CANDIDATE_PAGE_SIZE = 50
+const CANDIDATE_MAX_PAGES = 100
+
+function initialAssignmentPolicy() {
+  return { exclusive_exit: true, protocols: ['vless'], same_country_required: true, settle_grace_seconds: 900 }
+}
 
 function canonicalIp(value) {
   if (typeof value !== 'string' || !isIP(value.trim())) throw failure('INVALID_TARGET_EXIT_IP', 400)
@@ -68,6 +74,26 @@ function canonicalIp(value) {
 function select(source, fields) {
   if (!source) return null
   return Object.fromEntries(fields.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]))
+}
+
+function candidateRecord(value) {
+  if (!value || typeof value.proxy_id !== 'string' || !/^px_[0-9]+$/.test(value.proxy_id)) {
+    throw new IpPoolError('INVALID_RESPONSE')
+  }
+  let exitIp
+  try {
+    exitIp = canonicalIp(value.exit_ip)
+  } catch {
+    throw new IpPoolError('INVALID_RESPONSE')
+  }
+  const result = { proxy_id: value.proxy_id, exit_ip: exitIp }
+  for (const key of ['country_code', 'region', 'city', 'health_status']) {
+    result[key] = typeof value[key] === 'string' ? value[key] : null
+  }
+  for (const key of ['distance_km', 'quality_score', 'latency_ms']) {
+    result[key] = typeof value[key] === 'number' && Number.isFinite(value[key]) ? value[key] : null
+  }
+  return result
 }
 
 function assignmentRecord(value) {
@@ -223,6 +249,78 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
       blacklist: entry?.blacklist || null,
       operation: entry?.operation || null,
     })
+  }
+
+  async function candidates(vmId) {
+    if (closed) throw failure('CLOSED', 503)
+    const entry = entryFor(vmId)
+    let assignment
+    if (entry?.assignment?.assignment_id) {
+      assignment = assignmentRecord(await client.getAssignment(entry.assignment.assignment_id))
+    } else {
+      const ref = `vm2api:${instanceId}:${vmId}`
+      const result = await client.listAssignments(ref)
+      if (!Array.isArray(result?.assignments)) throw new IpPoolError('INVALID_RESPONSE')
+      const found = result.assignments.find((item) => item.consumer_ref === ref)
+      if (found) assignment = assignmentRecord(found)
+    }
+    // Read the latest upstream context without reconciling or creating any local state.
+    // Reassignment uses the same default policy as assign, with the original fixed anchor.
+    const context =
+      assignment && assignment.state !== 'released'
+        ? { assignment_id: assignment.assignment_id, require_new_exit_ip: false }
+        : {
+            policy: initialAssignmentPolicy(),
+            ...(assignment?.anchor ? { anchor: copy(assignment.anchor) } : {}),
+            require_new_exit_ip: false,
+          }
+    const result = []
+    const seenIps = new Set()
+    const seenProxies = new Set()
+    let complete = false
+    for (let pageIndex = 0; pageIndex < CANDIDATE_MAX_PAGES; pageIndex += 1) {
+      let page
+      try {
+        page = await client.candidates({
+          ...context,
+          limit: CANDIDATE_PAGE_SIZE,
+          exclude_proxy_ids: [...seenProxies],
+        })
+      } catch (error) {
+        if (error instanceof IpPoolError && error.code === 'NO_ELIGIBLE_PROXY') {
+          complete = true
+          break
+        }
+        throw error
+      }
+      if (!Array.isArray(page?.candidates) || page.candidates.length > CANDIDATE_PAGE_SIZE) {
+        throw new IpPoolError('INVALID_RESPONSE')
+      }
+      const remaining = Number.isInteger(page.eligible_count) && page.eligible_count >= 0 ? page.eligible_count : null
+      if (remaining !== null && remaining < page.candidates.length) throw new IpPoolError('INVALID_RESPONSE')
+      if (!page.candidates.length) {
+        complete = remaining === null || remaining === 0
+        break
+      }
+      const before = seenProxies.size
+      for (const value of page.candidates) {
+        const candidate = candidateRecord(value)
+        seenProxies.add(candidate.proxy_id)
+        if (!seenIps.has(candidate.exit_ip)) {
+          seenIps.add(candidate.exit_ip)
+          result.push(candidate)
+        }
+      }
+      if (seenProxies.size === before) break
+      if (
+        remaining === page.candidates.length ||
+        (remaining === null && page.candidates.length < CANDIDATE_PAGE_SIZE)
+      ) {
+        complete = true
+        break
+      }
+    }
+    return { candidates: result, complete, fetched_at: now() }
   }
 
   function isManaged(vmId) {
@@ -587,12 +685,7 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
             client.assign({
               consumer_ref: `vm2api:${instanceId}:${vmId}`,
               ...(target ? { target_exit_ip: target } : {}),
-              policy: {
-                exclusive_exit: true,
-                protocols: ['vless'],
-                same_country_required: true,
-                settle_grace_seconds: 900,
-              },
+              policy: initialAssignmentPolicy(),
             }),
           )
           entry.assignment = assignmentRecord(result.assignment)
@@ -828,6 +921,7 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
   interval?.unref?.()
   return {
     view,
+    candidates,
     execute,
     isManaged,
     canDelete,

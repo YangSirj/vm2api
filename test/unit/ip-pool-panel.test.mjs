@@ -76,6 +76,64 @@ test('access is never cacheable and only explicit POST obtains a link', async ()
   assert.equal(f.responses[1].payload.data.uri, 'vless://test-only')
 })
 
+test('admins can read candidates without reading a body or executing an operation', async () => {
+  const f = fixture()
+  const result = { vm_id: 'vm-02', candidates: [{ id: 'candidate-01' }] }
+  const candidateCalls = []
+  f.service.candidates = async (vmId) => {
+    candidateCalls.push(vmId)
+    return result
+  }
+  assert.equal(await f.panel.handle(admin('GET'), f.res, '/api/panel/ip-pool/vms/vm-02/candidates'), true)
+  assert.deepEqual(candidateCalls, ['vm-02'])
+  assert.deepEqual(f.responses, [{ status: 200, payload: { ok: true, data: result } }])
+  assert.equal(f.headers['Cache-Control'], 'no-store')
+  assert.equal(f.bodyReads(), 0)
+  assert.equal(f.calls.length, 0)
+  assert.equal(f.state.state, 'applied')
+})
+
+test('nonadmins cannot read candidates', async () => {
+  const f = fixture()
+  f.service.candidates = async () => assert.fail('authorization must precede candidate lookup')
+  await f.panel.handle(
+    { method: 'GET', panelRole: 'user', panelUser: 'test' },
+    f.res,
+    '/api/panel/ip-pool/vms/vm-01/candidates',
+  )
+  assert.equal(f.responses[0].status, 403)
+  assert.equal(f.responses[0].payload.error.code, 'forbidden')
+  assert.equal(f.headers['Cache-Control'], 'no-store')
+  assert.equal(f.bodyReads(), 0)
+  assert.equal(f.calls.length, 0)
+})
+
+test('candidates require a configured IP pool', async () => {
+  const f = fixture({ configured: false })
+  await f.panel.handle(admin('GET'), f.res, '/api/panel/ip-pool/vms/vm-01/candidates')
+  assert.equal(f.responses[0].status, 503)
+  assert.equal(f.responses[0].payload.error.code, 'ip_pool_not_configured')
+  assert.equal(f.headers['Cache-Control'], 'no-store')
+  assert.equal(f.bodyReads(), 0)
+  assert.equal(f.calls.length, 0)
+})
+
+test('candidate lookup failures use the safe error response without executing an operation', async () => {
+  const f = fixture()
+  f.service.candidates = async () => {
+    throw new Error('sensitive upstream failure')
+  }
+  await f.panel.handle(admin('GET'), f.res, '/api/panel/ip-pool/vms/vm-01/candidates')
+  assert.equal(f.responses[0].status, 409)
+  assert.deepEqual(f.responses[0].payload, {
+    ok: false,
+    error: { code: 'ip_pool_failed', message: 'IP 池操作失败，请核对当前状态后再继续。' },
+  })
+  assert.equal(f.headers['Cache-Control'], 'no-store')
+  assert.equal(f.bodyReads(), 0)
+  assert.equal(f.calls.length, 0)
+})
+
 test('legacy binding cannot bypass IP-pool ownership using a new proxy', async () => {
   const f = fixture()
   const handled = await f.panel.handle(admin('POST', { vm_id: 'vm-01' }), f.res, '/api/panel/proxies/px-free/bind')

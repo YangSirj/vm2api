@@ -148,6 +148,11 @@ export function createIpPoolPanel(ctx, { env = process.env } = {}) {
         ctx.json(res, 200, { ok: true, data: service.view(vmId) })
         return true
       }
+      if (req.method === 'GET' && action === 'candidates') {
+        const result = await service.candidates(vmId)
+        ctx.json(res, 200, { ok: true, data: result })
+        return true
+      }
       if (req.method !== 'POST' || !ACTIONS.has(action)) throw denied('not_found', '接口不存在。', 404)
       const body = await readBody(req, 16 * 1024)
       const result = await service.execute(vmId, action, body || {})
