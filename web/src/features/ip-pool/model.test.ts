@@ -6,6 +6,7 @@ import {
   incidentTime,
   poolActions,
   poolManaged,
+  poolExitSummary,
   type IpPoolView,
 } from './model'
 
@@ -25,6 +26,69 @@ const applied: IpPoolView = {
     verified_at: '2026-10-22T08:00:00Z',
   },
 }
+
+describe('IP pool card exit summary', () => {
+  it('shows a matching verified allocation as the recorded exit', () => {
+    expect(poolExitSummary(applied)).toMatchObject({
+      label: '出口',
+      value: '203.0.113.7',
+    })
+    expect(poolExitSummary(applied).title).toContain('2026-10-22T08:00:00Z')
+  })
+
+  it('labels a new assignment as allocation while keeping old verification in the tooltip', () => {
+    const summary = poolExitSummary({
+      ...applied,
+      state: 'pending',
+      assignment: {
+        ...applied.assignment!,
+        version: 3,
+        current_exit_ip: '203.0.113.9',
+      },
+    })
+    expect(summary).toMatchObject({ label: '分配出口', value: '203.0.113.9' })
+    expect(summary.title).toContain('历史核验出口 203.0.113.7')
+  })
+
+  it('does not label an errored allocation as verified', () => {
+    expect(
+      poolExitSummary({
+        ...applied,
+        error: { code: 'EXIT_MISMATCH', message: '出口不符' },
+      }).label
+    ).toBe('分配出口')
+  })
+
+  it('does not show retired or blacklisted IPs as current exits', () => {
+    expect(poolExitSummary({ ...applied, state: 'released' }).value).toBe(
+      '已释放'
+    )
+    expect(poolExitSummary({ ...applied, state: 'blacklisted' }).value).toBe(
+      '已标黑'
+    )
+    expect(
+      poolExitSummary({
+        ...applied,
+        assignment: { ...applied.assignment!, state: 'released' },
+      }).value
+    ).toBe('未知')
+  })
+
+  it('shows missing data as unknown and an explicit unassigned state as unassigned', () => {
+    expect(poolExitSummary(undefined).value).toBe('未知')
+    expect(
+      poolExitSummary({
+        configured: false,
+        vm_id: 'vm-01',
+        state: 'unassigned',
+      }).value
+    ).toBe('未知')
+    expect(
+      poolExitSummary({ configured: true, vm_id: 'vm-01', state: 'unassigned' })
+        .value
+    ).toBe('未分配')
+  })
+})
 
 describe('IP pool account actions', () => {
   it('protects the login IP while still allowing verification, copying and ending login', () => {

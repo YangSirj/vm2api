@@ -51,6 +51,7 @@ import {
 } from '@/features/vm/use-vm-column-order'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
+import { VmIpPoolSummary } from '@/features/vm/vm-ip-pool-summary'
 import { VmOwnerLine } from '@/features/vm/vm-owner-line'
 
 /** 列的宽度与弹性；顺序由 `useVmColumnOrder` 决定，不写死在这里。 */
@@ -367,6 +368,7 @@ function SlotCell({ vm }: { vm: Vm }) {
         vm={vm}
         className='truncate text-[10.5px] text-muted-foreground'
       />
+      <VmIpPoolSummary vmId={vm.id} />
     </div>
   )
 }

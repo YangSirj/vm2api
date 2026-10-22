@@ -35,6 +35,7 @@ import {
 } from '@/features/vm/usage-windows'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
+import { VmIpPoolSummary } from '@/features/vm/vm-ip-pool-summary'
 import { useVmPerms } from '@/features/vm/vm-perms'
 import {
   bladeState,
@@ -463,7 +464,10 @@ export const VmBlade = memo(function VmBlade({
           />
         ) : null}
       </div>
-      <SpecLine vm={vm} />
+      <div className='min-w-0 space-y-1'>
+        <SpecLine vm={vm} />
+        <VmIpPoolSummary vmId={vm.id} />
+      </div>
       {state === 'live' ? (
         <BladeUsage vm={vm} accounts={accounts} now={now} />
       ) : state === 'unprobed' ? (

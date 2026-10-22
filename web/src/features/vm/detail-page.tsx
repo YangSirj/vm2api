@@ -5,7 +5,7 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
-import { Link, useNavigate, useParams } from '@tanstack/react-router'
+import { Link, useNavigate, useParams, useSearch } from '@tanstack/react-router'
 import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
@@ -61,6 +61,7 @@ import { VmAccountTab } from '@/features/vm/detail-account-tab'
 import { VmOpsTab } from '@/features/vm/detail-ops-tab'
 import { VmOverviewTab } from '@/features/vm/detail-overview-tab'
 import { VmProxyTab } from '@/features/vm/detail-proxy-tab'
+import { validateVmDetailSearch } from '@/features/vm/detail-search'
 import { VmDetailSkeleton } from '@/features/vm/detail-skeleton'
 import { VmTestTab } from '@/features/vm/detail-test-tab'
 import { bootOutcome, vmTodayCounts } from '@/features/vm/detail-today'
@@ -101,11 +102,21 @@ type VmJob = {
   done?: (data: unknown) => void
 }
 
-/** 页签留在外层：切槽位时主体按 id 重挂清掉上一个槽的输入，但停在同一页签。 */
+/** 页签写入 URL，刷新和 IP 管理入口都能回到指定页签。 */
 export function VmDetailPage() {
   const { id } = useParams({ from: '/_authenticated/vm/$id' })
-  const [tab, setTab] = useState('overview')
-  return <VmDetailBody key={id} id={id} tab={tab} onTabChange={setTab} />
+  const search = useSearch({ from: '/_authenticated/vm/$id' })
+  const navigate = useNavigate({ from: '/vm/$id' })
+  return (
+    <VmDetailBody
+      key={id}
+      id={id}
+      tab={search.tab || 'overview'}
+      onTabChange={(tab) =>
+        navigate({ search: validateVmDetailSearch({ tab }), replace: true })
+      }
+    />
+  )
 }
 
 function VmDetailBody({
@@ -354,7 +365,11 @@ function VmDetailBody({
             <Select
               value={id}
               onValueChange={(next) =>
-                navigate({ to: '/vm/$id', params: { id: next } })
+                navigate({
+                  to: '/vm/$id',
+                  params: { id: next },
+                  search: validateVmDetailSearch({ tab }),
+                })
               }
             >
               <SelectTrigger className='h-8 w-[220px]' aria-label='切换节点'>

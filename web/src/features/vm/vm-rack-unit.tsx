@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils'
 import { slotCredentialLabel } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
+import { VmIpPoolSummary } from '@/features/vm/vm-ip-pool-summary'
 import {
   BLADE_STATE_CLASS,
   BladeControls,
@@ -101,15 +102,18 @@ export const VmUnit = memo(function VmUnit({
         </span>
         <TierBadge vm={vm} className='ms-auto h-4 px-1 text-[9.5px]' />
       </div>
-      <span
-        title={email || undefined}
-        className={cn(
-          'col-span-2 truncate text-[12.5px] font-semibold',
-          !email && 'font-medium text-muted-foreground'
-        )}
-      >
-        {slotCredentialLabel(vm, true)}
-      </span>
+      <div className='col-span-2 min-w-0 space-y-1'>
+        <div
+          title={email || undefined}
+          className={cn(
+            'truncate text-[12.5px] font-semibold',
+            !email && 'font-medium text-muted-foreground'
+          )}
+        >
+          {slotCredentialLabel(vm, true)}
+        </div>
+        <VmIpPoolSummary vmId={vm.id} />
+      </div>
       {state === 'live' ? (
         <span className='flex items-end gap-1.5'>
           {vmWindows(vm).map((w) => (

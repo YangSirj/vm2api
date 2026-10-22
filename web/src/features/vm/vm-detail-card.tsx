@@ -56,6 +56,7 @@ import {
 import { VmUsagePanel } from '@/features/vm/usage-windows'
 import { refreshBlockedReason } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
+import { VmIpPoolSummary } from '@/features/vm/vm-ip-pool-summary'
 import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import {
   canReclaimVm,
@@ -223,6 +224,11 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <Field label='代理' compact>
               <ProxyChip vm={vm} compact />
             </Field>
+            {admin ? (
+              <Field label='IP 池' compact>
+                <VmIpPoolSummary vmId={vm.id} />
+              </Field>
+            ) : null}
             {admin ? (
               <Field label='租户属主' compact>
                 <span className='text-xs'>

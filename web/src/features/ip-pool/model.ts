@@ -94,6 +94,41 @@ export function assignmentApplied(view: IpPoolView): boolean {
   )
 }
 
+/** 分配目标与历史探测分开，释放/标黑后不把旧出口当作当前出口。 */
+export function poolExitSummary(view: IpPoolView | undefined) {
+  const history = view?.applied?.exit_ip
+    ? `历史核验出口 ${view.applied.exit_ip}${view.applied.verified_at ? `（${view.applied.verified_at}）` : ''}`
+    : '没有出口核验记录'
+  const current =
+    view?.assignment &&
+    !['released', 'blacklisted', 'unassigned'].includes(view.state) &&
+    !['released', 'blacklisted'].includes(view.assignment.state)
+      ? view.assignment.current_exit_ip
+      : ''
+  if (current && view) {
+    const verified =
+      !view.error &&
+      ['applied', 'login_locked'].includes(view.state) &&
+      assignmentApplied(view)
+    return {
+      label: verified ? '出口' : '分配出口',
+      value: current,
+      title: verified
+        ? `已核验出口 ${current}（${view.applied?.verified_at}）；显示已有记录，未实时探测`
+        : `当前分配 ${current}，尚未核验为当前出口；${history}`,
+    }
+  }
+  const value =
+    view?.state === 'released'
+      ? '已释放'
+      : view?.state === 'blacklisted'
+        ? '已标黑'
+        : view?.configured && view.state === 'unassigned'
+          ? '未分配'
+          : '未知'
+  return { label: '出口', value, title: `${value}；${history}` }
+}
+
 export function poolActions(view: IpPoolView) {
   const locked = view.login_locked || view.state === 'login_locked'
   const active = Boolean(
