@@ -77,6 +77,7 @@ export function createIpPoolPanel(ctx, { env = process.env } = {}) {
       const view = service.view(vmId)
       if (req.method === 'GET') return
       if (service.busy(vmId)) throw denied('ip_pool_busy', '出口正在处理，请稍后再操作。')
+      if (!action && req.method === 'DELETE' && (await service.canDelete?.(vmId))) return
       if (
         action === 'allocate-proxy' ||
         (!action && req.method === 'DELETE') ||

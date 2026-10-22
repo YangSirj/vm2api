@@ -432,6 +432,101 @@ test('blacklist uses the verified historical event exit and reports real deletio
   assert.ok(f.env.marker)
 })
 
+test('fully retired banned slots can be deleted without lifting their ban or losing audit evidence', async (t) => {
+  const f = await fixture(t)
+  await f.service.execute(VM, 'assign')
+  await f.service.execute(VM, 'blacklist', {
+    confirmation: 'user_confirmed',
+    incident_id: 'retired-account',
+    exit_ip_at_event: FIRST,
+    occurred_at: '2026-10-22T01:00:00Z',
+  })
+  f.client.retryDeletion = async (id) => ({
+    blacklist_id: id,
+    deletion_state: 'succeeded',
+    endpoint_access_revoked: true,
+    inventory_removed: true,
+    retryable: false,
+  })
+  await f.service.execute(VM, 'retry-deletion')
+  assert.equal(await f.service.canDelete(VM), false, 'upstream deletion alone does not detach local resources')
+  await f.service.execute(VM, 'release')
+  const data = loadIpPoolState(f.stateFile)
+  data.vms[VM].error = { code: 'ASSIGNMENT_CHANGED', message: 'legacy released-assignment poll' }
+  saveIpPoolState(f.stateFile, data)
+  const service = f.create()
+  const before = clone(loadIpPoolState(f.stateFile).vms[VM])
+  assert.equal(await service.canDelete(VM), true)
+  assert.equal(service.isManaged(VM), true)
+  assert.equal(service.isLocked(VM), true)
+  assert.ok(f.env.marker, 'ban maintenance hold remains')
+  assert.ok(before.capture?.proxy, 'historical snapshot remains as evidence')
+  assert.equal(before.assignment.state, 'released')
+  assert.deepEqual(loadIpPoolState(f.stateFile).vms[VM], before)
+  for (const action of ['assign', 'apply', 'replace', 'access', 'login-lock', 'login-unlock']) {
+    await assert.rejects(service.execute(VM, action), { code: 'BLACKLISTED' })
+  }
+
+  let drained
+  let started
+  const drainStarted = new Promise((resolve) => {
+    started = resolve
+  })
+  const originalDrain = f.adapter.drain
+  f.adapter.drain = async () => {
+    started()
+    return new Promise((resolve) => {
+      drained = resolve
+    })
+  }
+  const releasing = service.execute(VM, 'release')
+  await drainStarted
+  assert.equal(await service.canDelete(VM), false, 'a concurrent cleanup must finish before deletion')
+  drained({ ok: true, inflight: 0 })
+  await releasing
+  f.adapter.drain = originalDrain
+
+  const incomplete = [
+    ['active assignment', { assignment: { ...before.assignment, state: 'active' } }],
+    ['missing assignment', { assignment: null }],
+    ['applied bridge', { applied: { runtime: { container: 'old-bridge' } } }],
+    ['staged bridge', { staged: { runtime: { container: 'new-bridge' } } }],
+    ['old connection', { previous: [{ snapshot: { proxy: { id: 'old-proxy' } } }] }],
+    ['pending mutation', { pending_mutation: { type: 'release' } }],
+    ['pending apply', { pending_apply: true }],
+    ['pending release', { pending_release: true }],
+    ['interrupted operation', { operation: { id: f.env.marker, type: 'release' } }],
+    ['login lock', { login_locked: true }],
+    ['upstream deletion failed', { blacklist: { ...before.blacklist, deletion_state: 'failed' } }],
+    ['access not revoked', { blacklist: { ...before.blacklist, endpoint_access_revoked: false } }],
+    ['inventory not removed', { blacklist: { ...before.blacklist, inventory_removed: false } }],
+    ['cleanup failure', { error: { code: 'CLEANUP_FAILED', message: 'not cleaned' } }],
+  ]
+  for (const [reason, change] of incomplete) {
+    const altered = clone(data)
+    Object.assign(altered.vms[VM], change)
+    saveIpPoolState(f.stateFile, altered)
+    assert.equal(await f.create().canDelete(VM), false, reason)
+  }
+  saveIpPoolState(f.stateFile, data)
+  f.env.vmProxy = { id: 'unexpected-live-binding' }
+  assert.equal(await f.create().canDelete(VM), false, 'current binding overrides historical cleanup evidence')
+  f.env.vmProxy = null
+  f.adapter.capture = async () => {
+    throw new Error('cannot inspect VM')
+  }
+  assert.equal(await f.create().canDelete(VM), false, 'unverified binding remains protected')
+
+  f.adapter.hold = async () => {
+    throw new Error('VM was removed; must not be held again')
+  }
+  f.client.getAssignment = async () => {
+    throw new Error('retired assignment must not be polled')
+  }
+  assert.equal((await f.create().pollEvents()).ok, true)
+  assert.deepEqual(loadIpPoolState(f.stateFile).vms[VM], before, 'terminal polling retains the ban audit unchanged')
+})
+
 test('unverified blacklist evidence is rejected and a confirmed ban survives a failed drain', async (t) => {
   const f = await fixture(t)
   await f.service.execute(VM, 'assign')

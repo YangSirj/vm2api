@@ -219,6 +219,39 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
     return !!entry && (entry.state !== 'released' || !!entry.maintenance_id || entry.ban_confirmed)
   }
 
+  function retiredBan(entry) {
+    return !!(
+      entry?.ban_confirmed &&
+      entry.state === 'blacklisted' &&
+      entry.assignment?.state === 'released' &&
+      entry.blacklist?.deletion_state === 'succeeded' &&
+      entry.blacklist.endpoint_access_revoked === true &&
+      entry.blacklist.inventory_removed === true &&
+      !entry.applied &&
+      !entry.staged &&
+      !entry.previous?.length &&
+      !entry.pending_mutation &&
+      !entry.pending_apply &&
+      !entry.pending_release &&
+      !entry.operation &&
+      !entry.login_locked &&
+      (!entry.error || entry.error.code === 'ASSIGNMENT_CHANGED')
+    )
+  }
+
+  async function canDelete(vmId) {
+    if (!isManaged(vmId)) return true
+    const entry = entryFor(vmId)
+    if (active.has(vmId) || !retiredBan(entry)) return false
+    try {
+      // capture is the current binding; entry.capture is retained historical evidence.
+      const current = await adapter.capture(vmId)
+      return current?.vmId === vmId && current.proxy === null && !active.has(vmId) && retiredBan(entry)
+    } catch {
+      return false
+    }
+  }
+
   function isLocked(vmId) {
     const entry = entryFor(vmId)
     return entry?.login_locked === true || entry?.ban_confirmed === true
@@ -645,6 +678,8 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
   async function reconcileForPoll(entry, events = []) {
     const vmId = entry.vm_id
     if (active.has(vmId)) return false
+    // Keep the ban and its audit record after local removal, without trying to hold a deleted VM.
+    if (retiredBan(entry)) return true
     if (!entry.assignment) return true
     active.add(vmId)
     try {
@@ -732,6 +767,7 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
     view,
     execute,
     isManaged,
+    canDelete,
     isLocked,
     busy: (vmId) => active.has(vmId),
     pollEvents,

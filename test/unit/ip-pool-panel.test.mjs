@@ -36,6 +36,7 @@ function fixture({ configured = true } = {}) {
       },
     },
     state,
+    service,
     calls,
     responses,
     headers,
@@ -86,6 +87,40 @@ test('legacy edits to a bound managed proxy are rejected before mutation', async
   const f = fixture()
   await f.panel.handle(admin('DELETE'), f.res, '/api/panel/proxies/px-01')
   assert.equal(f.responses[0].status, 409)
+})
+
+test('only VM deletion may pass the completed IP-pool cleanup check', async () => {
+  const f = fixture()
+  f.state.state = 'blacklisted'
+  let checks = 0
+  f.service.canDelete = async () => {
+    checks += 1
+    return true
+  }
+  assert.equal(await f.panel.handle(admin('DELETE'), f.res, '/api/panel/vms/vm-01'), false)
+  assert.equal(checks, 1)
+  for (const action of ['reset', 'recreate', 'package', 'allocate-proxy']) {
+    assert.equal(await f.panel.handle(admin('POST'), f.res, `/api/panel/vms/vm-01/${action}`), true)
+    assert.equal(f.responses.at(-1).payload.error.code, 'ip_pool_managed')
+  }
+  assert.equal(await f.panel.handle(admin('PATCH', { proxy_id: 'px-free' }), f.res, '/api/panel/vms/vm-01'), true)
+  assert.equal(f.responses.at(-1).payload.error.code, 'ip_pool_managed')
+  assert.equal(await f.panel.handle(admin('POST'), f.res, '/api/panel/vms/vm-01/oauth/exchange'), true)
+  assert.equal(f.responses.at(-1).payload.error.code, 'ip_pool_login_lock_required')
+  assert.equal(checks, 1)
+})
+
+test('unfinished cleanup and busy IP operations still block VM deletion', async () => {
+  const f = fixture()
+  f.service.canDelete = async () => false
+  assert.equal(await f.panel.handle(admin('DELETE'), f.res, '/api/panel/vms/vm-01'), true)
+  assert.equal(f.responses.at(-1).payload.error.code, 'ip_pool_managed')
+  f.service.busy = () => true
+  f.service.canDelete = async () => {
+    assert.fail('busy deletion must be rejected before checking cleanup')
+  }
+  assert.equal(await f.panel.handle(admin('DELETE'), f.res, '/api/panel/vms/vm-01'), true)
+  assert.equal(f.responses.at(-1).payload.error.code, 'ip_pool_busy')
 })
 
 test('unmanaged legacy request body remains available to the original route', async () => {
