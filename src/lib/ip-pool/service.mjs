@@ -19,6 +19,8 @@ const MESSAGES = {
   DRAIN_FAILED: '账号仍有请求在途，保持暂停。',
   EXIT_IP_MISMATCH: '实际出口与分配不一致，保持暂停。',
   PROBE_FAILED: '无法核验实际出口，保持暂停。',
+  TIMEZONE_LOOKUP_FAILED: '无法确定分配出口的时区，保持暂停，请稍后核对后应用。',
+  TIMEZONE_RUNTIME_FAILED: '槽位实际时区未能同步，保持暂停，请核对后应用。',
   SLOT_NOT_RUNNING: '槽位尚未运行，保持暂停，启动后再应用并核验。',
   RESTORE_FAILED: '未能解除本次维护标记，账号继续暂停。',
   CLEANUP_FAILED: '旧代理连接尚未确认结束，账号继续暂停。',
@@ -402,7 +404,7 @@ export function createIpPoolService({ client, adapter, runtime, stateFile, insta
       proxy_id: null,
     }
     save()
-    const bound = checked(await adapter.apply(entry.vm_id, bridge), 'OPERATION_FAILED')
+    const bound = checked(await adapter.apply(entry.vm_id, bridge, access.expected_exit_ip), 'OPERATION_FAILED')
     entry.staged.proxy_id = bound.proxy_id
     save()
     phase(entry, 'probing')

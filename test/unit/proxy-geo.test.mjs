@@ -169,6 +169,102 @@ test('detectGeo caches per proxy and publishes location on the snapshot', async 
   assert.equal(snap.geo_v6.error, null)
 })
 
+test('detectGeo explicitly looks up the measured IP despite a cached location and skips the IPv6 probe', async () => {
+  const calls = []
+  let v6Calls = 0
+  const pool = makePool(async (url, options) => {
+    calls.push({ url, options })
+    return options.endpoint
+      ? { ok: true, geo: { ip: '63.127.59.53', country: 'United States', timezone: 'America/New_York' } }
+      : { ok: true, geo: { ip: '74.211.108.82', country: 'United States', timezone: 'America/Los_Angeles' } }
+  })
+  pool.geoV6Lookup = async () => {
+    v6Calls += 1
+    return { ok: false, error: 'geo_ipv6_unavailable' }
+  }
+  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  await pool.detectGeo(id)
+
+  const measured = await pool.detectGeo(id, { expectedIp: '63.127.59.53' })
+  assert.equal(measured.ok, true)
+  assert.equal(measured.cached, false)
+  assert.equal(measured.geo.ip, '63.127.59.53')
+  assert.equal(measured.geo.timezone, 'America/New_York')
+  assert.equal(pool.proxyTimezone(id), 'America/New_York')
+  assert.equal(calls[1].url, 'socks5://1.2.3.4:1080')
+  assert.match(calls[1].options.endpoint, /^http:\/\/ip-api\.com\/json\/63\.127\.59\.53\?fields=/)
+  assert.equal(calls[1].options.timeoutMs, 8000)
+
+  await pool.detectGeo(id, { expectedIp: '63.127.59.53' })
+  assert.equal(calls.length, 3, 'every expected-IP lookup must query fresh metadata')
+  assert.equal(v6Calls, 1, 'expected-IP mode must not make another IPv6 source probe')
+})
+
+test('detectGeo rejects an invalid expected IP before querying or changing stored metadata', async () => {
+  const pool = makePool(async () => assert.fail('invalid expected IP must not query metadata'))
+  pool.geoV6Lookup = async () => assert.fail('invalid expected IP must not probe IPv6')
+  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  const before = pool.snapshot().proxies.find((p) => p.id === id)
+  for (const expectedIp of [null, '', 'not-an-ip', '63.127.59.53/path', 123]) {
+    const result = await pool.detectGeo(id, { expectedIp })
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'expected_ip_invalid')
+  }
+  assert.deepEqual(
+    pool.snapshot().proxies.find((p) => p.id === id),
+    before,
+  )
+})
+
+test('detectGeo rejects mismatched or missing explicit IP metadata instead of accepting stale Geo', async () => {
+  let reply = { ok: true, geo: { ip: '203.0.113.9', timezone: 'Asia/Tokyo' } }
+  const pool = makePool(async () => reply)
+  pool.geoV6Lookup = async () => ({ ok: false, error: 'geo_ipv6_unavailable' })
+  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  await pool.detectGeo(id)
+  pool.geoV6Lookup = async () => assert.fail('expected-IP mode must not probe IPv6')
+
+  for (const ip of ['74.211.108.82', undefined, 'not-an-ip']) {
+    reply = { ok: true, geo: { ip, timezone: 'America/Los_Angeles' } }
+    const result = await pool.detectGeo(id, { expectedIp: '63.127.59.53' })
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'geo_ip_mismatch')
+    assert.equal(result.geo.ip, '203.0.113.9', 'mismatched metadata must not overwrite the last known IP')
+    assert.equal(result.geo.timezone, 'Asia/Tokyo')
+    assert.equal(result.geo.error, 'geo_ip_mismatch')
+  }
+})
+
+test('detectGeo surfaces explicit-IP metadata transport failures even with a populated cache', async () => {
+  let reply = { ok: true, geo: { ip: '203.0.113.9', timezone: 'Asia/Tokyo' } }
+  const pool = makePool(async () => reply)
+  pool.geoV6Lookup = async () => ({ ok: false, error: 'geo_ipv6_unavailable' })
+  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  await pool.detectGeo(id)
+  reply = { ok: false, error: 'geo_transport_error:timeout' }
+  pool.geoV6Lookup = async () => assert.fail('expected-IP mode must not probe IPv6')
+
+  const result = await pool.detectGeo(id, { force: true, expectedIp: '63.127.59.53' })
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'geo_transport_error:timeout')
+  assert.equal(result.geo.ip, '203.0.113.9')
+  assert.equal(result.geo.error, 'geo_transport_error:timeout')
+})
+
+test('detectGeo accepts equivalent IPv6 spellings for explicit IP metadata', async () => {
+  let endpoint
+  const pool = makePool(async (_url, options) => {
+    endpoint = options.endpoint
+    return { ok: true, geo: { ip: '2001:0db8:0:0:0:0:0:9', timezone: 'Asia/Tokyo' } }
+  })
+  pool.geoV6Lookup = async () => assert.fail('expected-IP mode must not probe IPv6')
+  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  const result = await pool.detectGeo(id, { expectedIp: '2001:DB8::9' })
+  assert.equal(result.ok, true)
+  assert.equal(result.cached, false)
+  assert.match(endpoint, /\/2001%3Adb8%3A%3A9\?fields=/)
+})
+
 test('detectGeo keeps IPv4 and IPv6 results separate and records IPv6 unavailability', async () => {
   const pool = makePool(async () => ({
     ok: true,

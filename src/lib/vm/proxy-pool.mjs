@@ -16,7 +16,7 @@ import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
 import { validTimezone } from '../core/timezone.mjs'
-import { lookupProxyGeo, lookupProxyGeoV6 } from './proxy-geo.mjs'
+import { DEFAULT_GEO_V6_LOOKUP_ENDPOINT, lookupProxyGeo, lookupProxyGeoV6 } from './proxy-geo.mjs'
 import {
   DNS_PRIMARY_AUTO,
   DNS_UPSTREAMS,
@@ -1192,13 +1192,19 @@ export class ProxyPool extends EventEmitter {
    * Resolve one proxy's exit-node location through the proxy itself.
    * `force` re-queries a row that already has a location; without it a cached
    * hit is returned untouched so bind-time detection stays cheap.
+   * `expectedIp` looks up a separately measured exit explicitly, bypassing the
+   * cache and rejecting metadata for any other address. It skips the IPv6 probe.
    */
-  async detectGeo(proxyId, { force = false } = {}) {
+  async detectGeo(proxyId, { force = false, expectedIp } = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
     if (blocked) return { ok: false, error: blocked, proxy: this.publicProxy(p) }
-    const v4Cached = !force && p.geo_checked_at && p.geo_ip
+    const explicitIp = expectedIp !== undefined
+    const lookupIp =
+      explicitIp && typeof expectedIp === 'string' && net.isIP(expectedIp.trim()) ? normalizeSocksHost(expectedIp) : ''
+    if (explicitIp && !lookupIp) return { ok: false, error: 'expected_ip_invalid', proxy: this.publicProxy(p) }
+    const v4Cached = !explicitIp && !force && p.geo_checked_at && p.geo_ip
     const v6Cached = !force && p.geo_v6_checked_at
     if (v4Cached && v6Cached) {
       return {
@@ -1223,10 +1229,18 @@ export class ProxyPool extends EventEmitter {
       }
     }
     const timeoutMs = this.state.config?.geo_timeout_ms
-    let v4Result = v4Cached ? { ok: true } : await this.geoLookup(url, { timeoutMs })
+    const lookupOptions = { timeoutMs }
+    if (explicitIp)
+      lookupOptions.endpoint = DEFAULT_GEO_V6_LOOKUP_ENDPOINT.replace('{ip}', encodeURIComponent(lookupIp))
+    let v4Result = v4Cached ? { ok: true } : await this.geoLookup(url, lookupOptions)
+    if (explicitIp && v4Result?.ok) {
+      const returnedIp = typeof v4Result.geo?.ip === 'string' ? v4Result.geo.ip.trim() : ''
+      if (!net.isIP(returnedIp) || normalizeSocksHost(returnedIp) !== lookupIp) {
+        v4Result = { ok: false, error: 'geo_ip_mismatch' }
+      }
+    }
     if (!v4Cached) this._applyGeoResult(p, v4Result)
-    let v6Result = v6Cached ? { ok: true } : await this.geoV6Lookup(url, { timeoutMs })
-    if (!v6Cached) this._applyGeoV6Result(p, v6Result)
+    if (!explicitIp && !v6Cached) this._applyGeoV6Result(p, await this.geoV6Lookup(url, { timeoutMs }))
     this.save()
     const pub = this.publicProxy(p)
     if (!v4Result?.ok) {

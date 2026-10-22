@@ -2,18 +2,34 @@ import path from 'node:path'
 import net from 'node:net'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { getVm, patchVmRecord, bindVmProxy, waitForSlotDrain } from '../vm/vm-registry.mjs'
+import {
+  getVm,
+  patchVmRecord,
+  bindVmProxy,
+  waitForSlotDrain,
+  persistVmTimezone,
+  persistVmRuntime,
+} from '../vm/vm-registry.mjs'
 import { withVmLock, isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { inspectContainer } from '../vm/vm-runtime.mjs'
 import { slotExecArgv, slotExecContainer } from '../vm/slot-exec.mjs'
-import { reloadSlotReady } from '../vm/slot-runtime.mjs'
+import { reloadSlotReady, startSlotReady } from '../vm/slot-runtime.mjs'
+import { validTimezone } from '../core/timezone.mjs'
 import { ensureProxyEgress, stopProxyEgress, drainEgressForProxyConfig, isLocalEgressProxy } from '../vm/egress.mjs'
 import { boundVmIdsOf } from '../vm/proxy-pool.mjs'
 
 const exec = promisify(execFile)
 const failure = (code) => Object.assign(new Error(code), { code })
+
+async function readSlotTimezone(vm) {
+  const { stdout } = await exec('docker', slotExecArgv(vm, ['printenv', 'TZ']), {
+    timeout: 10000,
+    maxBuffer: 4096,
+  })
+  return validTimezone(String(stdout || '').trim())
+}
 
 async function probeSlotExit(vm) {
   try {
@@ -61,6 +77,26 @@ export function createVmAdapter({
       }))
   const bind = ops.bindVmProxy || ((id, proxy) => bindVmProxy(projectRoot, id, proxy))
   const probe = ops.probeSlotExit || probeSlotExit
+  const readTimezone = ops.readTimezone || readSlotTimezone
+  const recreate =
+    ops.recreate ||
+    (async (vm) => {
+      const result = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, {
+        recreate: true,
+        routing: typeof routingConfig === 'function' ? routingConfig() : routingConfig,
+      })
+      const runtime = result?.runtime || result?.docker?.runtime
+      if (result?.ok && runtime) persistVmRuntime(projectRoot, vm.id, runtime)
+      return result
+    })
+
+  async function runtimeTimezone(vm) {
+    try {
+      return await readTimezone(vm)
+    } catch {
+      throw failure('TIMEZONE_RUNTIME_FAILED')
+    }
+  }
 
   function requireVm(id) {
     if (!isValidVmId(id)) throw failure('invalid_vm_id')
@@ -125,8 +161,9 @@ export function createVmAdapter({
       }
       return background ? { ok: false, inflight: 0, background_inflight: background } : models
     },
-    async apply(vmId, bridge) {
+    async apply(vmId, bridge, expectedExitIp) {
       const vm = maintained(vmId)
+      if (!net.isIP(String(expectedExitIp || ''))) throw failure('expected_exit_ip_required')
       const port = Number(bridge?.port)
       if (!Number.isInteger(port) || port < 1 || port > 65535) throw failure('invalid_bridge_port')
       const created = proxyPool.ensureSocks(
@@ -139,19 +176,36 @@ export function createVmAdapter({
       if (!created.ok) throw failure(created.error || 'proxy_import_failed')
       const egress = await ensure(created.proxy)
       if (!egress?.ok) throw failure('proxy_egress_failed')
+      // The SOCKS server address may be a relay, so query the allocated public exit explicitly.
+      const detected = await proxyPool.detectGeo(created.proxy.id, { force: true, expectedIp: expectedExitIp })
+      const timezone = validTimezone(detected?.geo?.timezone)
+      if (!detected?.ok || detected.geo?.ip !== expectedExitIp || !timezone) throw failure('TIMEZONE_LOOKUP_FAILED')
       const runtime = await inspect(vm)
+      const previousTimezone = runtime?.running ? await runtimeTimezone(vm) : null
       const binding = proxyPool.bind(created.proxy.id, vmId)
       if (!binding.ok) throw failure(binding.error || 'proxy_bind_failed')
       bind(vmId, proxyPool.getProxyForVm(vmId))
-      if (!runtime?.running) return { ok: true, proxy_id: created.proxy.id, requires_start: true, worker: null }
-      const worker = await reload(read(vmId))
-      if (!worker?.ok) throw failure('slot_reload_failed')
-      return { ok: true, proxy_id: created.proxy.id, worker: { ok: true }, requires_start: false }
+      if (!persistVmTimezone(projectRoot, vmId, timezone, { source: 'proxy_geo' }))
+        throw failure('TIMEZONE_RUNTIME_FAILED')
+      if (!runtime?.running)
+        return { ok: true, proxy_id: created.proxy.id, timezone, requires_start: true, worker: null }
+      // Restarting a container keeps its old TZ environment. Recreate when the zone changed.
+      const worker = await (previousTimezone === timezone ? reload : recreate)(read(vmId))
+      if (!worker?.ok || worker.rust_ok === false) throw failure('slot_reload_failed')
+      if ((await runtimeTimezone(read(vmId))) !== timezone) throw failure('TIMEZONE_RUNTIME_FAILED')
+      return { ok: true, proxy_id: created.proxy.id, timezone, worker: { ok: true }, requires_start: false }
     },
     async verify(vmId, expectedExitIp) {
       const vm = maintained(vmId)
       if (!net.isIP(String(expectedExitIp || ''))) throw failure('expected_exit_ip_required')
       if (!(await inspect(vm))?.running) return { ok: false, code: 'slot_not_running' }
+      const timezone = validTimezone(vm.timezone)
+      if (
+        !timezone ||
+        (vm.fingerprint && vm.fingerprint.timezone !== timezone) ||
+        (await runtimeTimezone(vm)) !== timezone
+      )
+        throw failure('TIMEZONE_RUNTIME_FAILED')
       const result = await probe(vm)
       if (!result?.ok) return { ok: false, code: result?.code || 'slot_exit_probe_failed' }
       if (result.exit_ip !== expectedExitIp)

@@ -13,6 +13,20 @@ const SECOND = '192.0.2.20'
 const SECRET = 'synthetic-access-secret'
 const clone = (value) => JSON.parse(JSON.stringify(value))
 
+test('timezone failure keeps the allocated exit pending and does not restore or settle', async (t) => {
+  const { service, adapter, env, log } = await fixture(t)
+  adapter.apply = async () => {
+    throw Object.assign(new Error('timezone'), { code: 'TIMEZONE_LOOKUP_FAILED' })
+  }
+  assert.equal((await service.execute(VM, 'assign')).error.code, 'TIMEZONE_LOOKUP_FAILED')
+  assert.ok(env.marker)
+  assert.equal(
+    log.some(([action]) => action === 'restore' || action === 'settle'),
+    false,
+  )
+  assert.equal(env.assignment.current_exit_ip, FIRST)
+})
+
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'vm2api-pool-service-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
@@ -132,7 +146,8 @@ async function fixture(t) {
       log.push(['drain', id])
       return { ok: true, inflight: 0 }
     },
-    async apply(id, bridge) {
+    async apply(id, bridge, expectedExitIp) {
+      assert.equal(expectedExitIp, env.assignment.current_exit_ip)
       log.push(['apply', id, bridge.container])
       env.vmProxy = { id: `local-${bridge.port}` }
       env.actualExit = bridge.exit_ip
