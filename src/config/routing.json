@@ -67,6 +67,8 @@
     "strategy": "balanced",
     "manual_schedule_wins": true,
     "queue_max": 50,
+    "queue_wait_timeout_ms": 30000,
+    "seat_migration_wait_ms": 10000,
     "seat_grace_ms": 30000,
     "seat_budget_reserve_pct": 0.02,
     "fallback_wait_timeout_ms": 30000,

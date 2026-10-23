@@ -8,6 +8,7 @@ import { PoolScheduler, normalizePoolRouting } from '../../src/lib/pool/pool-sch
 import { SeatPlanner, budgetAllows, rankSeatCandidates } from '../../src/lib/pool/seat-planner.mjs'
 import { servePoolSeatStream } from '../../src/lib/admin/pool-seat-stream.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
+import { resolveSeatIdentity } from '../../src/lib/identity/identity-rewrite.mjs'
 
 const MODEL = 'claude-test'
 
@@ -247,7 +248,7 @@ test('balanced spreads 4 devices 2/2, fill packs 4/0; headroom then vmId break t
     { vmId: 'vm-b', seatCap: 4, headroom: 0.5 },
   ]
   assert.equal(rankSeatCandidates(tie, { strategy: 'balanced', openOf })[0].vmId, 'vm-b')
-  assert.equal(rankSeatCandidates(tie, { strategy: 'fill', openOf })[0].vmId, 'vm-b')
+  assert.equal(rankSeatCandidates(tie, { strategy: 'fill', openOf })[0].vmId, 'vm-a')
   const prio = [{ ...tie[0], priority: 9 }, tie[1]]
   assert.equal(rankSeatCandidates(prio, { strategy: 'balanced', openOf })[0].vmId, 'vm-a')
   const even = [
@@ -267,6 +268,213 @@ test('queue timeout is pool_queue_timeout', async (t) => {
   assert.ok(Date.now() - started >= 70)
   assert.equal(pool.planner.pending(), 0)
   held.release()
+})
+
+test('same device independent conversations follow balance; parent and child reuse one seat', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 4, maxConcurrency: 3 } },
+    { id: 'vm-02', policy: { sessionSlots: 4, maxConcurrency: 3 } },
+  ])
+  const identify = (session, parent = '') =>
+    resolveSeatIdentity({
+      inbound: { metadata: { user_id: { device_id: 'one-device', session_id: session } } },
+      rootSessionId: parent,
+    }).key
+  const first = await pool.selectAndReserve({ model: MODEL, seatKey: identify('first'), deviceVmId: 'vm-01' })
+  const second = await pool.selectAndReserve({ model: MODEL, seatKey: identify('second'), deviceVmId: first.vmId })
+  assert.notEqual(second.vmId, first.vmId)
+  const child = await pool.selectAndReserve({ model: MODEL, seatKey: identify('child', 'first') })
+  assert.equal(child.vmId, first.vmId)
+  assert.equal(pool.planner.openCount(first.vmId), 1)
+  for (const hold of [first, second, child]) hold.release()
+})
+
+test('fill uses an occupied VM only while it has capacity; busy VM does not trap a new conversation', async (t) => {
+  const pool = setup(
+    t,
+    [
+      { id: 'vm-01', policy: { sessionSlots: 4, maxConcurrency: 2 } },
+      { id: 'vm-02', policy: { sessionSlots: 4, maxConcurrency: 2 } },
+    ],
+    { strategy: 'fill' },
+  )
+  const calls = []
+  for (const key of ['a', 'b', 'c'])
+    calls.push(
+      await pool.selectAndReserve({
+        model: MODEL,
+        seatKey: `seat:sess:${key}`,
+        deviceVmId: 'vm-01',
+        allowWait: false,
+      }),
+    )
+  assert.deepEqual(
+    calls.map((x) => x.vmId),
+    ['vm-01', 'vm-01', 'vm-02'],
+  )
+  assert.equal(pool.queuedTotal(), 0)
+  calls.forEach((x) => x.release())
+})
+
+test('balanced considers requests, not just seats; draining counts as one effective request slot', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 5, maxConcurrency: 4 } },
+    { id: 'vm-02', policy: { sessionSlots: 5, maxConcurrency: 4 } },
+  ])
+  const a = await seat(pool, 'a', { familyVmId: 'vm-01' })
+  const b = await seat(pool, 'b', { familyVmId: 'vm-02' })
+  const c = await seat(pool, 'c', { familyVmId: 'vm-02' })
+  const a2 = await seat(pool, 'a')
+  const a3 = await seat(pool, 'a')
+  const d = await seat(pool, 'd')
+  assert.equal(d.vmId, 'vm-02', '2 requests on 2 seats beat 3 requests on 1 seat')
+  const rows = await pool.eligibleCandidates({ model: MODEL })
+  const ranked = pool.rankNewSeats(rows.map((x) => ({ ...x, draining: x.vmId === 'vm-02' })))
+  assert.equal(ranked.find((x) => x.vmId === 'vm-02').loadRatio, 3)
+  for (const hold of [a, b, c, a2, a3, d]) hold.release()
+})
+
+test('total wait caps sticky plus global stages and releases an expired queue ticket', async (t) => {
+  const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 1, maxConcurrency: 1 } }], {
+    sticky: 40,
+    fallback: 200,
+  })
+  pool.config.queue_wait_timeout_ms = 100
+  const held = await seat(pool, 'busy')
+  const started = Date.now()
+  const result = await seat(pool, 'next', { deviceVmId: 'vm-01' })
+  assert.equal(result.reason, 'pool_queue_timeout')
+  assert.ok(Date.now() - started < 200)
+  assert.equal(pool.queuedTotal(), 0)
+  held.release()
+  assert.equal(pool.planner.seats.size, 0)
+})
+
+test('reselection shares remaining wait budget but time between selections is not charged', async (t) => {
+  const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 1 } }], { fallback: 70 })
+  const held = await seat(pool, 'busy')
+  const queueBudget = { remainingMs: 115 }
+  const first = await seat(pool, 'next', { queueBudget })
+  assert.equal(first.reason, 'pool_queue_timeout')
+  assert.ok(queueBudget.remainingMs > 0 && queueBudget.remainingMs < 65)
+  const remaining = queueBudget.remainingMs
+  await new Promise((r) => setTimeout(r, 90))
+  assert.equal(queueBudget.remainingMs, remaining)
+  const started = Date.now()
+  const second = await seat(pool, 'next', { queueBudget })
+  assert.equal(second.reason, 'pool_queue_timeout')
+  assert.ok(Date.now() - started < 70)
+  assert.equal(queueBudget.remainingMs, 0)
+  held.release()
+})
+
+test('waiting conversation migrates after grace while an unrelated conversation keeps running', async (t) => {
+  const pool = setup(
+    t,
+    [
+      { id: 'vm-01', policy: { sessionSlots: 4, maxConcurrency: 1 } },
+      { id: 'vm-02', policy: { sessionSlots: 4, maxConcurrency: 1 } },
+    ],
+    { seat_grace_ms: 30000 },
+  )
+  pool.config.seat_migration_wait_ms = 40
+  const original = await seat(pool, 'a', { familyVmId: 'vm-01' })
+  original.release()
+  const blocker = await seat(pool, 'b', { familyVmId: 'vm-01' })
+  const start = Date.now()
+  const moved = await seat(pool, 'a')
+  assert.equal(moved.vmId, 'vm-02')
+  assert.equal(moved.selectionReason, 'seat-migrated')
+  assert.equal(moved.migrationFromVm, 'vm-01')
+  assert.ok(Date.now() - start >= 35)
+  assert.equal(pool.inflight.get(blocker.accountId), 1)
+  assert.equal(pool.planner.seatOf(planned('a')).vmId, 'vm-02')
+  blocker.release()
+  moved.release()
+})
+
+test('a warm conversation whose seat expired still waits before moving off its busy home', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 3, maxConcurrency: 1 } },
+    { id: 'vm-02', policy: { sessionSlots: 3, maxConcurrency: 1 } },
+  ])
+  pool.config.seat_migration_wait_ms = 40
+  const blocker = await seat(pool, 'other', { familyVmId: 'vm-01' })
+  const began = Date.now()
+  const moved = await seat(pool, 'warm-conversation', { familyVmId: 'vm-01' })
+  assert.equal(moved.vmId, 'vm-02')
+  assert.equal(moved.migrationFromVm, 'vm-01')
+  assert.ok(Date.now() - began >= 35)
+  blocker.release()
+  moved.release()
+})
+
+test('migration drains its task family and moves queued requests without replay or excess concurrency', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 4, maxConcurrency: 2 } },
+    { id: 'vm-02', policy: { sessionSlots: 4, maxConcurrency: 2 } },
+  ])
+  pool.config.seat_migration_wait_ms = 35
+  const a = await seat(pool, 'a', { familyVmId: 'vm-01' })
+  const b = await seat(pool, 'b', { familyVmId: 'vm-01' })
+  let started = 0
+  const next = seat(pool, 'a').then((x) => (++started, x))
+  const child = seat(pool, 'a').then((x) => (++started, x))
+  await waitFor(() => pool.planner.seatOf(planned('a'))?.migrationRequested)
+  assert.equal(started, 0)
+  b.release()
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(started, 0, 'new work must not go back to a draining family')
+  assert.equal(pool.planner.seatOf(planned('a')).vmId, a.vmId)
+  a.release()
+  const holds = await Promise.all([next, child])
+  assert.deepEqual(
+    holds.map((x) => x.vmId),
+    ['vm-02', 'vm-02'],
+  )
+  assert.ok(holds.every((x) => x.migrationFromVm === 'vm-01'))
+  assert.equal(pool.inflight.get('account-2'), 2)
+  assert.equal(pool.planner.openCount('vm-01'), 0)
+  assert.equal(pool.planner.openCount('vm-02'), 1)
+  holds.forEach((x) => x.release())
+  assert.equal(pool.inflight.size, 0)
+  assert.equal(pool.queuedTotal(), 0)
+})
+
+test('cancelling migration unpauses its seat; an expired wait cannot start after release', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { sessionSlots: 2, maxConcurrency: 1 } },
+    { id: 'vm-02', policy: { sessionSlots: 2, maxConcurrency: 1 } },
+  ])
+  pool.config.seat_migration_wait_ms = 30
+  const active = await seat(pool, 'a')
+  const controller = new AbortController()
+  const waiting = seat(pool, 'a', { signal: controller.signal })
+  await waitFor(() => pool.planner.seatOf(planned('a'))?.migrationRequested)
+  controller.abort()
+  await assert.rejects(waiting, { code: 'selection_cancelled' })
+  assert.equal(pool.planner.seatOf(planned('a')).migrationRequested, false)
+  active.release()
+  assert.equal(pool.queuedTotal(), 0)
+  assert.equal(pool.inflight.size, 0)
+})
+
+test('migration only targets a VM allowed for every queued member of the family', async (t) => {
+  const pool = setup(
+    t,
+    [
+      { id: 'vm-01', policy: { sessionSlots: 2, maxConcurrency: 1 } },
+      { id: 'vm-02', policy: { sessionSlots: 2, maxConcurrency: 1 } },
+    ],
+    { sticky: 100 },
+  )
+  pool.config.seat_migration_wait_ms = 25
+  const active = await seat(pool, 'a')
+  const next = seat(pool, 'a', { allowSeatMigration: false })
+  const result = await next
+  assert.equal(result.reason, 'pool_queue_timeout')
+  assert.equal(pool.planner.seatOf(planned('a')).vmId, active.vmId)
+  active.release()
 })
 
 test('queue_max=2: the 3rd waiter is refused at once; a freed place admits the next', async (t) => {

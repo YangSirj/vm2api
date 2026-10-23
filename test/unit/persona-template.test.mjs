@@ -43,6 +43,7 @@ import {
   wrapMandatoryConstraint,
 } from '../../src/lib/identity/crs-persona.mjs'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
+import { applyCacheTtlToBody, resolveCacheTtl, validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
   buildOfficialEnvironmentSection,
@@ -393,6 +394,36 @@ test('cli-hop strip then rewrites official and official_full from the configured
       }
     })
   }
+})
+
+test('rewritten cli-hop official_full template and messages follow the caller TTL together', () => {
+  withRoutingFile({ persona_preset: 'official_full', overlay_preset: 'off', cache_ttl: '1h' }, (file) => {
+    for (const ttl of ['5m', '1h']) {
+      const inbound = {
+        model: 'claude-opus-5-5',
+        max_tokens: 128,
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl } }] },
+        ],
+      }
+      const before = structuredClone(inbound)
+      const selected = resolveCacheTtl({ body: inbound, routingFile: file })
+      const prepared = prepareCliHopBody(inbound, { cacheTtl: selected })
+      const templated = applyCrsUnofficialPersona(prepared, {
+        routingFile: file,
+        mode: 'official_full',
+        forceConfigured: true,
+        officialClient: false,
+      })
+      const out = applyCacheTtlToBody(templated, selected)
+      const systemMarkers = out.system.filter((block) => block.cache_control)
+      assert.equal(systemMarkers.length, 2)
+      assert.ok(systemMarkers.every((block) => block.cache_control.ttl === ttl))
+      assert.equal(out.messages.at(-1).content.at(-1).cache_control.ttl, ttl)
+      validateCacheBreakpoints(out)
+      assert.deepEqual(inbound, before)
+    }
+  })
 })
 
 test('caller system stays in segment 5 and role=system stays in the transcript', () => {

@@ -370,10 +370,10 @@ test('resolveInboundIdentity reads explicit device_id from the raw inbound body'
 
 const LONG_TURN = 'please refactor the scheduler module and explain every single change you make'
 
-test('resolveSeatIdentity: device id first, then metadata session, never the API key', () => {
+test('resolveSeatIdentity: independent session first, device only as fallback, never the API key', () => {
   const both = { metadata: { user_id: JSON.stringify({ device_id: 'dev-1', session_id: 'sess-1' }) } }
   const inbound = { ...both, messages: [{ role: 'user', content: LONG_TURN }] }
-  assert.deepEqual(resolveSeatIdentity({ inbound, body: inbound }), { key: 'seat:dev:dev-1', source: 'device' })
+  assert.deepEqual(resolveSeatIdentity({ inbound, body: inbound }), { key: 'seat:sess:sess-1', source: 'session' })
   const explicit = { device_id: 'dev-2', messages: [{ role: 'user', content: LONG_TURN }] }
   assert.equal(resolveSeatIdentity({ inbound: explicit, body: explicit }).key, 'seat:dev:dev-2')
   const header = resolveSeatIdentity({
@@ -389,6 +389,19 @@ test('resolveSeatIdentity: device id first, then metadata session, never the API
     key: 'seat:sess:sess-9',
     source: 'session',
   })
+})
+
+test('seat identity separates conversations on one device and groups explicit parent/sub-agent hops', () => {
+  const body = (session_id) => ({ metadata: { user_id: { device_id: 'one-device', session_id } } })
+  const first = resolveSeatIdentity({ inbound: body('first') })
+  const other = resolveSeatIdentity({ inbound: body('other') })
+  assert.notEqual(first.key, other.key)
+  assert.equal(
+    resolveSeatIdentity({ inbound: body('first'), headers: { 'x-claude-code-agent-id': 'agent-a' } }).key,
+    first.key,
+  )
+  assert.equal(resolveSeatIdentity({ inbound: body('child'), rootSessionId: 'first' }).key, first.key)
+  assert.equal(resolveSeatIdentity({ inbound: {}, headers: { 'x-session-id': 'header-session' } }).source, 'session')
 })
 
 test('resolveSeatIdentity: same IP + UA + first turn hashes to one identity whatever the API key', () => {

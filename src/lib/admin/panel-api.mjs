@@ -93,6 +93,7 @@ import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/opena
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
+import { collectSlotMemory } from '../vm/slot-memory-usage.mjs'
 import { telemetryUploadInterval } from '../vm/worker-telemetry.mjs'
 
 export function ok(data, meta) {
@@ -594,8 +595,9 @@ export async function buildDashboard({
   const poolSnap = snapshotPool(proxyPool)
   const listed = listVms(cfg.paths.project, routingConfig)
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
+  const memoryById = await collectSlotMemory(listed)
   const vms = listed.map((v) =>
-    enrichVm(v, accountQuota, active, {
+    enrichVm({ ...v, memory_usage: memoryById.get(v.id) }, accountQuota, active, {
       routingConfig,
       pool,
       poolSnap,
@@ -724,8 +726,9 @@ export async function buildVmList({
   const poolSnap = snapshotPool(proxyPool)
   const listed = filterVmsForPanel(listVms(cfg.paths.project, routingConfig), { role, userId: ownerUserId })
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
+  const memoryById = await collectSlotMemory(listed)
   const vms = listed.map((v) =>
-    enrichVm(v, accountQuota, active, {
+    enrichVm({ ...v, memory_usage: memoryById.get(v.id) }, accountQuota, active, {
       routingConfig,
       pool,
       poolSnap,
@@ -793,7 +796,8 @@ export async function buildVmDetail({
   const poolSnap = snapshotPool(proxyPool)
   const listed = [summarizeVm(vm, cfg.paths.project, routingConfig)]
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed, { cacheMs: 0 })
-  const summary = enrichVm(listed[0], accountQuota, active, {
+  const memoryById = await collectSlotMemory(listed)
+  const summary = enrichVm({ ...listed[0], memory_usage: memoryById.get(id) }, accountQuota, active, {
     routingConfig,
     pool,
     poolSnap,
@@ -2044,6 +2048,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     fingerprint: v.fingerprint || null,
     physical_features: publicPhysicalFeatures(v),
     runtime: v.runtime || null,
+    memory_usage: v.memory_usage || null,
     ip: v.ip || v.runtime?.ip || null,
     pid: v.pid || v.runtime?.pid || null,
     container: v.container || v.runtime?.container || null,

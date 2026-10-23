@@ -8,6 +8,7 @@ import { slotCredentialLabel } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
 import { VmIpPoolSummary } from '@/features/vm/vm-ip-pool-summary'
+import { VmMemoryUsage } from '@/features/vm/vm-memory-usage'
 import {
   BLADE_STATE_CLASS,
   BladeControls,
@@ -114,6 +115,14 @@ export const VmUnit = memo(function VmUnit({
         </div>
         <VmIpPoolSummary vmId={vm.id} />
       </div>
+      <div className='col-span-2 grid min-w-0 grid-cols-2 gap-2'>
+        <div className='col-start-2 min-w-0'>
+          <VmMemoryUsage vm={vm} />
+        </div>
+        <div className='col-span-2 ms-auto w-full max-w-[180px]'>
+          <VmSeats vm={vm} compact />
+        </div>
+      </div>
       {state === 'live' ? (
         <span className='flex items-end gap-1.5'>
           {vmWindows(vm).map((w) => (
@@ -149,7 +158,6 @@ export const VmUnit = memo(function VmUnit({
         </span>
       ) : null}
       <div className='hairline-t col-span-2 mt-0.5 flex items-center gap-1 pt-1 text-[10.5px] text-muted-foreground'>
-        <VmSeats vm={vm} compact />
         <BladeControls vm={vm} />
       </div>
     </article>

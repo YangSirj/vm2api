@@ -159,7 +159,7 @@ export function ProtocolPane({
       >
         <SettingRow
           label='默认缓存写入 TTL'
-          desc='请求头、请求显式 TTL 与会话锁定值优先；system 模板中的显式 TTL 不变。'
+          desc='优先跟随调用端明确传入的 TTL；重写请求的 system 模板与消息缓存使用同一时长。'
         >
           <ChipGroup
             label='默认缓存写入 TTL'
@@ -172,8 +172,10 @@ export function ProtocolPane({
           />
         </SettingRow>
         <p className='text-xs leading-5 text-muted-foreground'>
-          保存后作为新会话和自有缺省标记的
-          TTL。已有会话锁定值不变，官方透传仍保留调用方断点及缺失 TTL。
+          请求头 x-kin-cache-ttl 优先，其次是请求体缓存标记的 TTL。 标记省略 ttl
+          表示 5
+          分钟，也会更新已有会话；完全没有缓存标记时才沿用会话值或此默认值。
+          官方透传保留调用方断点及缺失 TTL。
         </p>
       </PaneSection>
       <PaneSection

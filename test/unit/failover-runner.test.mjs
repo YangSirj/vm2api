@@ -219,6 +219,79 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
   assert.deepEqual(pins.get('conversation-1'), { accountId: 'account-1', vmId: 'vm-01' })
 })
 
+test('a drained seat migration replaces only that conversation and family bindings before execution', async () => {
+  const scheduler = new Scheduler([candidate(2)])
+  scheduler.selectAndReserve = async () => ({
+    ...candidate(2),
+    ok: true,
+    seatMoved: true,
+    migrationFromVm: 'vm-01',
+    slotIndex: 1,
+    release() {},
+  })
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-migrated-binding-'))
+  let stickyRouter
+  try {
+    stickyRouter = new StickyRouter({ dataDir: root, config: { enabled: true } })
+    for (const key of ['conversation', 'family', 'unrelated']) {
+      stickyRouter.bind(key, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'old-native-session' })
+    }
+    const runner = new FailoverRunner({ scheduler, stickyRouter })
+    const result = await runner.run({
+      requestId: 'migrate-whole-session',
+      model: 'claude-test',
+      canonicalBody: { messages: [{ role: 'user', content: 'Full conversation supplied' }] },
+      stickyKey: 'conversation',
+      familyKey: 'family',
+      familyVmId: 'vm-01',
+      applyAttempt: (body, selected, extra) => {
+        assert.equal(extra.stickyBound.vmId, 'vm-02')
+        assert.equal(extra.stickyBound.sessionId, null, 'previous native session cannot cross VMs')
+        assert.equal(stickyRouter.resolve('family').vmId, 'vm-02')
+        return { body, meta: { sessionId: 'new-native-session' } }
+      },
+      callAttempt: () => success(),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(stickyRouter.resolve('conversation').sessionId, 'new-native-session')
+    assert.equal(stickyRouter.resolve('unrelated').vmId, 'vm-01')
+  } finally {
+    stickyRouter?.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('failover carries the consumed queue budget to the next selection without charging model execution', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  scheduler.config = { queue_wait_timeout_ms: 100 }
+  const original = scheduler.selectAndReserve.bind(scheduler)
+  let calls = 0
+  scheduler.selectAndReserve = async (args) => {
+    assert.equal(args.queueBudget.remainingMs, calls === 0 ? 100 : 20)
+    args.queueBudget.remainingMs = 20
+    calls++
+    return original(args)
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'shared-queue-budget',
+    model: 'claude-test',
+    canonicalBody: {},
+    callAttempt: async ({ candidate: selected }) => {
+      if (selected.accountId === 'account-2') return success()
+      await new Promise((resolve) => setTimeout(resolve, 120))
+      return {
+        ok: false,
+        status: 503,
+        terminalState: 'rejected',
+        body: { error: { code: 'slot_busy', message: 'no free slot' } },
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(calls, 2)
+})
+
 test('#A20: a late completion never writes back a pin another request released', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const pins = new Map([['conversation-1', { accountId: 'account-1', vmId: 'vm-01', generation: 3 }]])

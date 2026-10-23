@@ -257,7 +257,8 @@ const routingRt = createRoutingRuntime({
   },
   // Lazy: the monitor is built after the runtime. An unknown 429 asks for one
   // /usage hop through the same single-flight, bounded queue as the timer.
-  probeUsageOne: (vmId) => usageProbeMonitor?.probeNow?.(vmId, 'rate_limited_unknown'),
+  probeUsageOne: (vmId) =>
+    routingConfig.usage_probe?.enabled === true ? usageProbeMonitor?.probeNow?.(vmId, 'rate_limited_unknown') : undefined,
 })
 
 const {

@@ -44,6 +44,8 @@ type PoolPaneProps = {
 /** 与后端 DEFAULT_POOL_ROUTING / failover-runner 默认值一致。 */
 const POOL_DEFAULTS = {
   queue_max: 50,
+  queue_wait_timeout_ms: 30000,
+  seat_migration_wait_ms: 10000,
   seat_grace_ms: 30000,
   seat_budget_reserve_pct: 0.02,
   sticky_wait_timeout_ms: 45000,
@@ -81,14 +83,14 @@ const STRATEGIES: {
   {
     id: 'balanced',
     title: '平衡',
-    desc: '新设备先去占用比例最低的 VM，负载摊平，单台额度消耗慢。',
+    desc: '新会话先选运行与排队负载低的 VM；再比较席位和额度余量，不随机分配。',
     demo: [2, 1, 3],
     next: 1,
   },
   {
     id: 'fill',
     title: '填充',
-    desc: '新设备先去占用比例最高、还没满的 VM，集中用满少数几台，其它保持空闲。',
+    desc: '新会话优先使用已有席位且仍有请求容量的 VM；同等条件选额度用量高的，不在满载 VM 上硬排队。',
     demo: [4, 3, 1],
     next: 1,
   },
@@ -246,35 +248,54 @@ function Segment({
   )
 }
 
-/** 一次请求最长能排多久：有家设备先守原 VM，再进全局；整体被总重试时限截断。 */
+/** 一次请求最长能排多久：已有绑定的会话先守原 VM，再进全局；整体被总重试时限截断。 */
 function QueueTimeline({
   sticky,
   fallback,
   deadline,
+  queueLimit,
+  migrationWait,
 }: {
   sticky: number
   fallback: number
   deadline: number
+  queueLimit: number
+  migrationWait: number
 }) {
-  const total = Math.max(sticky + fallback, deadline, 1)
+  const limit = Math.min(deadline, queueLimit)
+  const total = Math.max(limit, 1)
   const lanes: { title: string; segments: [string, number, string][] }[] = [
     {
-      title: '回头设备（已有家 VM）',
+      title: '已有席位的会话',
       segments: [
-        ['守原 VM', sticky, 'bg-primary/80 text-primary-foreground'],
+        [
+          '等原 VM / 排空后重选',
+          Math.min(sticky, limit),
+          'bg-primary/80 text-primary-foreground',
+        ],
+      ],
+    },
+    {
+      title: '有绑定、尚未入座的会话',
+      segments: [
+        [
+          '守原 VM',
+          Math.min(sticky, limit),
+          'bg-primary/80 text-primary-foreground',
+        ],
         [
           '全局排队',
-          fallback,
+          Math.min(fallback, Math.max(0, limit - sticky)),
           'bg-[color:var(--status-caution-solid)] text-white',
         ],
       ],
     },
     {
-      title: '新设备',
+      title: '新会话',
       segments: [
         [
           '全局排队',
-          fallback,
+          Math.min(fallback, limit),
           'bg-[color:var(--status-caution-solid)] text-white',
         ],
       ],
@@ -301,17 +322,17 @@ function QueueTimeline({
             <div
               aria-hidden
               className='absolute inset-y-0 w-0.5 bg-[color:var(--status-bad-solid)]'
-              style={{ left: `${Math.min(100, (deadline / total) * 100)}%` }}
+              style={{ left: `${Math.min(100, (limit / total) * 100)}%` }}
             />
           </div>
         </div>
       ))}
       <p className='text-[11px] leading-4 text-muted-foreground'>
-        红线 = 总重试时限 {fmtDuration(deadline)}
-        ，任何等待都不会越过它；超时返回 529 <code>
-          pool_queue_timeout
-        </code>{' '}
-        并带 retry-after。
+        红线 = 等待总上限 {fmtDuration(limit)}
+        ，原 VM 和全局等待共用预算，重选不重新计时。会话等满{' '}
+        {fmtDuration(migrationWait)}
+        且有合格空闲 VM 时，先排空本会话再整体迁移；超时返回 529{' '}
+        <code>pool_queue_timeout</code> 并带 retry-after。
       </p>
     </div>
   )
@@ -453,6 +474,11 @@ export function PoolPane({
     'fallback_wait_timeout_ms',
     POOL_DEFAULTS.fallback_wait_timeout_ms
   )
+  const queueLimit = numOf(
+    pool,
+    'queue_wait_timeout_ms',
+    POOL_DEFAULTS.queue_wait_timeout_ms
+  )
   const deadline = numOf(
     failover,
     'total_retry_deadline_ms',
@@ -512,6 +538,8 @@ export function PoolPane({
     } else if (open === 'queue') {
       onPoolChange({
         queue_max: poolDraft.queue_max,
+        queue_wait_timeout_ms: poolDraft.queue_wait_timeout_ms,
+        seat_migration_wait_ms: poolDraft.seat_migration_wait_ms,
         sticky_wait_timeout_ms: poolDraft.sticky_wait_timeout_ms,
         fallback_wait_timeout_ms: poolDraft.fallback_wait_timeout_ms,
       })
@@ -570,7 +598,7 @@ export function PoolPane({
           icon={Layers}
           title='分配策略'
           value={strategy === 'fill' ? '填充' : '平衡'}
-          desc='Claude 新设备开席的优先顺序'
+          desc='Claude 新会话开席的优先顺序'
           pending={pending}
           disabled={saving}
           buttonRef={(node) => {
@@ -593,7 +621,7 @@ export function PoolPane({
         <SummaryButton
           icon={Hourglass}
           title='排队等待'
-          value={`${queueMax} 个 · ${fmtDuration(Math.max(sticky, fallbackWait))}`}
+          value={`${queueMax} 个 · 总等待 ${fmtDuration(queueLimit)}`}
           desc={`粘性 ${fmtDuration(sticky)} · 全局 ${fmtDuration(fallbackWait)}`}
           pending={pending}
           disabled={saving}
@@ -790,6 +818,42 @@ export function PoolPane({
                   }
                 />
                 <SliderSetting
+                  id='pool-migration-wait'
+                  label='会话迁移前等待'
+                  value={numOf(
+                    poolDraft,
+                    'seat_migration_wait_ms',
+                    POOL_DEFAULTS.seat_migration_wait_ms
+                  )}
+                  min={1000}
+                  max={120000}
+                  step={1000}
+                  format={fmtDuration}
+                  fallback={POOL_DEFAULTS.seat_migration_wait_ms}
+                  presets={[5000, 10000, 15000, 30000]}
+                  onChange={(value) =>
+                    updateDraft('pool', { seat_migration_wait_ms: value })
+                  }
+                />
+                <SliderSetting
+                  id='pool-total-wait'
+                  label='等待总上限（不含模型生成）'
+                  value={numOf(
+                    poolDraft,
+                    'queue_wait_timeout_ms',
+                    POOL_DEFAULTS.queue_wait_timeout_ms
+                  )}
+                  min={1000}
+                  max={120000}
+                  step={1000}
+                  format={fmtDuration}
+                  fallback={POOL_DEFAULTS.queue_wait_timeout_ms}
+                  presets={[10000, 15000, 30000, 60000]}
+                  onChange={(value) =>
+                    updateDraft('pool', { queue_wait_timeout_ms: value })
+                  }
+                />
+                <SliderSetting
                   id='pool-sticky-wait'
                   label='粘性等待'
                   value={numOf(
@@ -840,7 +904,17 @@ export function PoolPane({
                     'fallback_wait_timeout_ms',
                     POOL_DEFAULTS.fallback_wait_timeout_ms
                   )}
+                  migrationWait={numOf(
+                    poolDraft,
+                    'seat_migration_wait_ms',
+                    POOL_DEFAULTS.seat_migration_wait_ms
+                  )}
                   deadline={deadline}
+                  queueLimit={numOf(
+                    poolDraft,
+                    'queue_wait_timeout_ms',
+                    POOL_DEFAULTS.queue_wait_timeout_ms
+                  )}
                 />
               </>
             ) : null}

@@ -605,6 +605,7 @@ export class FailoverRunner {
       startedAt,
     })
     const deadline = budget.deadline
+    const queueBudget = { remainingMs: Number(this.scheduler.config?.queue_wait_timeout_ms ?? 30000) }
     const excluded = budget.excluded
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
@@ -717,12 +718,15 @@ export class FailoverRunner {
           stickyKey,
           stickyKeys: bindKeys,
           seatKey,
+          queueBudget,
           excluded,
           spilled,
           signal,
           deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
           pinVmId,
           familyVmId,
+          familyKey,
+          allowSeatMigration: Array.isArray(requestBody?.messages) && requestBody.messages.length > 0,
           deviceVmId: currentDeviceVmId,
           skipSessionSlot: skipSessionSeat,
           ownerScope,
@@ -782,6 +786,15 @@ export class FailoverRunner {
         return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
       }
       repairPending = false
+      if (selected.migrationFromVm) {
+        // A task moved while this request waited. Clear only its own old session
+        // pin; use the destination's native session, never the previous VM's.
+        for (const key of pinKeys) {
+          const bound = this.stickyRouter?.resolve?.(key)
+          if (bound?.vmId === selected.migrationFromVm) this.stickyRouter.rebindFamily?.(key, selected)
+        }
+        familyVmId = selected.vmId
+      }
       snapshotPins()
       const attemptStickyBound = pinBaseline.get(stickyKey) || null
       lastSelected = selected

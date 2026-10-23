@@ -139,9 +139,8 @@ import {
 import {
   applyCacheTtlToUsage,
   cacheBreakpointsFromRoutingFile,
-  pinConversationCacheTtl,
   resolveCacheTtl,
-  fillMissingCacheTtl,
+  applyCacheTtlToBody,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
 import { confirmCachePrefix, describeCacheContinuity, formatCacheBreak, trackCachePrefix } from './cache-prefix.mjs'
@@ -924,10 +923,17 @@ export function createHandleProtocol(deps) {
     // One-shot test calls (sub2api account test, new-api channel test) keep their
     // sticky identity but never hold a session seat the main conversation needs.
     const seatless = isProbe || isShortProbeRequest(inbound)
-    // Seat = inbound device (R1/R2); the API key never scopes it.
+    const parentSession = explicitParentSessionId(inbound, req.headers)
+    // One independent conversation / parent task per seat; device only as fallback.
     const seatKey = seatless
       ? null
-      : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
+      : resolveSeatIdentity({
+          inbound,
+          body: ctx.body,
+          headers: req.headers,
+          clientIp: clientIp(req),
+          rootSessionId: parentSession,
+        }).key
     const sessionKeys = stickyRouter?.sessionPoolKeys
       ? stickyRouter.sessionPoolKeys(req, inbound, {
           sessionId: inboundIdentity.sessionId,
@@ -941,7 +947,6 @@ export function createHandleProtocol(deps) {
     const stickyKey = sessionKeys.stickyKey || null
     const stickyKeys = sessionKeys.stickyKeys || []
     const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
-    const parentSession = explicitParentSessionId(inbound, req.headers)
     const familySession = parentSession || callerSession
     const familyTrusted =
       !!parentSession || (!!inboundIdentity.sessionId && familySession === inboundIdentity.sessionId)
@@ -962,10 +967,12 @@ export function createHandleProtocol(deps) {
       vmId: stickyBound?.vmId || '',
       epoch: 'pending',
     })
-    const requestedCacheTtl = pinConversationCacheTtl(
-      stickyKey || callerSession || outboundSessionId,
-      resolveCacheTtl({ headers: req.headers, body: inbound, routingFile: routingConfigPath }),
-    )
+    const requestedCacheTtl = resolveCacheTtl({
+      headers: req.headers,
+      body: inbound,
+      routingFile: routingConfigPath,
+      conversationKey: stickyKey || callerSession || outboundSessionId,
+    })
     let cacheTtl = requestedCacheTtl
     let preserveCacheBreakpoints = false
     const cacheBreakpoints = cacheBreakpointsFromRoutingFile(routingConfigPath)
@@ -1362,7 +1369,7 @@ export function createHandleProtocol(deps) {
                 cliVersion: OFFICIAL_CLI_VERSION,
                 identity,
               })
-              hopBody = fillMissingCacheTtl(hopBody, requestedCacheTtl)
+              hopBody = applyCacheTtlToBody(hopBody, requestedCacheTtl)
               enforceCacheLimit(hopBody)
               validateCacheBreakpoints(hopBody)
               personaHideTokens = personaHideForUnofficial(personaIn, hopBody, {

@@ -41,14 +41,14 @@ export function cacheTtlFromRoutingFile(filePath) {
   }
 }
 
-/** Highest explicit inbound TTL. Mixed requests use 1h, then every marker is normalized to it. */
+/** Highest inbound TTL; ephemeral without ttl means Anthropic's default 5m. */
 export function bodyCacheTtl(body) {
   if (!body || typeof body !== 'object') return null
   const ttls = []
   const collect = (control) => {
-    if (!control || typeof control !== 'object') return
+    if (!control || typeof control !== 'object' || control.type !== 'ephemeral') return
     const raw = String(control.ttl || '').trim()
-    if (raw) ttls.push(normalizeCacheTtl(raw))
+    ttls.push(raw ? normalizeCacheTtl(raw) : '5m')
   }
   collect(body.cache_control)
   if (Array.isArray(body.tools)) for (const tool of body.tools) collect(tool?.cache_control)
@@ -68,17 +68,16 @@ export function bodyRequestsHourCache(body) {
 }
 
 /**
- * Header, then an explicit 5m/1h on any inbound marker, then the settings menu.
- * Official Claude Code is included: its ttl-less markers mean "not chosen", so
- * they take the menu value instead of Anthropic's implicit 5m.
+ * Header, then the caller's marker TTL (implicit 5m included), then the
+ * conversation value or settings menu when there are no inbound markers.
+ * Any caller marker choice updates a warm conversation, including 1h -> 5m
+ * when Claude Code omits ttl to select Anthropic's default duration.
  */
-export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {}) {
+export function resolveCacheTtl({ headers = {}, body, routing, routingFile, conversationKey, now = Date.now() } = {}) {
   const hdr = headers[CACHE_TTL_HEADER] || headers['X-Kin-Cache-Ttl']
-  if (hdr != null && String(hdr).trim()) return normalizeCacheTtl(hdr)
-  const requested = bodyCacheTtl(body)
-  if (requested) return requested
-  if (routing) return cacheTtlFromRouting(routing)
-  return cacheTtlFromRoutingFile(routingFile)
+  const requested = hdr != null && String(hdr).trim() ? normalizeCacheTtl(hdr) : bodyCacheTtl(body)
+  const wanted = requested ?? (routing ? cacheTtlFromRouting(routing) : cacheTtlFromRoutingFile(routingFile))
+  return pinConversationCacheTtl(conversationKey, wanted, now, requested != null)
 }
 
 /** Native passthrough validates caller markers; it never repairs their budget or TTL. */
@@ -128,17 +127,16 @@ const CONVERSATION_TTL_LIMIT = 10_000
 const conversationTtls = new Map()
 
 /**
- * One conversation writes one TTL. Switching mid-conversation re-prices the
- * whole prefix and Anthropic rejects 1h after 5m, so the first resolved value
- * wins until the conversation is idle past that TTL; by then its cache is gone
- * and nothing is lost by re-resolving.
+ * Keep the conversation's last choice while its cache is warm, unless the
+ * caller explicitly selects a TTL. Rewritten bodies use that TTL on every
+ * owned marker so a change cannot create an invalid 5m-before-1h ordering.
  */
-export function pinConversationCacheTtl(conversationKey, ttl, now = Date.now()) {
+export function pinConversationCacheTtl(conversationKey, ttl, now = Date.now(), explicit = false) {
   const wanted = normalizeCacheTtl(ttl)
   const key = String(conversationKey || '').trim()
   if (!key) return wanted
   const hit = conversationTtls.get(key)
-  const pinned = hit && now - hit.at < CACHE_TTL_MS[hit.ttl] ? hit.ttl : wanted
+  const pinned = !explicit && hit && now - hit.at < CACHE_TTL_MS[hit.ttl] ? hit.ttl : wanted
   conversationTtls.delete(key)
   conversationTtls.set(key, { ttl: pinned, at: now })
   if (conversationTtls.size > CONVERSATION_TTL_LIMIT) {

@@ -1,9 +1,9 @@
 /**
  * Pre-scheduler seat book for the Claude pool.
  *
- * A seat is one inbound device (seat key) bound to one VM. Every concurrent
- * request of that device rides the same seat and shares the VM's concurrency;
- * a device is never split across VMs. Seat capacity is the VM's
+ * A seat is one conversation/task family bound to one VM. Concurrent
+ * requests of that family share the seat and VM concurrency. Separate
+ * conversations on the same device can occupy different VMs. Seat capacity is the VM's
  * `session_slots`; concurrency and RPM stay with PoolScheduler.reserve().
  *
  * Queues:
@@ -48,23 +48,35 @@ function headroomRank(value) {
 }
 
 /**
- * Order VMs for a new seat. Priority first; inside one level balanced takes
- * the lowest occupancy and fill the highest (still below cap). Ties go to the
- * larger headroom, then vmId so the result is deterministic.
- * @param {Array<{ vmId: string, priority?: number, seatCap: number, headroom?: number|null }>} candidates
- * @param {{ strategy: string, openOf: (vmId: string) => number }} opts
+ * Rank only admissible VMs. Balance by request load, then seat occupancy;
+ * fill by occupancy, then request load. Quota headroom breaks ties (fill
+ * consumes the smaller known remainder, balance the larger). Never random.
  */
 export function rankSeatCandidates(candidates, { strategy = 'balanced', openOf }) {
   const fill = normalizeSeatStrategy(strategy) === 'fill'
+  const load = (candidate) => Number(candidate.loadRatio) || 0
   return [...candidates].sort((left, right) => {
     const priority = (Number(right.priority) || 0) - (Number(left.priority) || 0)
     if (priority) return priority
-    const lo = occupancy(openOf(left.vmId), left.seatCap)
-    const ro = occupancy(openOf(right.vmId), right.seatCap)
-    if (lo !== ro) return fill ? ro - lo : lo - ro
+    const seats = occupancy(openOf(left.vmId), left.seatCap) - occupancy(openOf(right.vmId), right.seatCap)
+    const requests = load(left) - load(right)
+    if (fill) {
+      if (seats) return -seats
+      if (requests) return -requests
+    } else {
+      if (requests) return requests
+      if (seats) return seats
+    }
     const lh = headroomRank(left.headroom)
     const rh = headroomRank(right.headroom)
-    if (lh !== rh) return rh > lh ? 1 : -1
+    if (lh !== rh) {
+      // Unknown quota does not masquerade as nearly exhausted or fully unused.
+      if (!Number.isFinite(lh)) return 1
+      if (!Number.isFinite(rh)) return -1
+      return fill ? lh - rh : rh - lh
+    }
+    const recent = (Number(left.lastUsedAt) || 0) - (Number(right.lastUsedAt) || 0)
+    if (recent) return recent
     return String(left.vmId).localeCompare(String(right.vmId))
   })
 }
@@ -147,7 +159,7 @@ export class SeatPlanner {
     return (this.vmQueues.get(String(vmId)) || []).some((ticket) => ticket.kind === 'conc')
   }
 
-  open(seatKey, { vmId, accountId = null, cap = 0 }) {
+  open(seatKey, { vmId, accountId = null, cap = 0, migrationFromVm = null }) {
     const key = String(seatKey)
     const id = String(vmId)
     let book = this.byVm.get(id)
@@ -157,7 +169,17 @@ export class SeatPlanner {
     }
     let index = 0
     while (book.has(index)) index += 1
-    const seat = { seatKey: key, vmId: id, accountId, index, inflight: 0, graceUntil: null, timer: null, live: true }
+    const seat = {
+      seatKey: key,
+      vmId: id,
+      accountId,
+      index,
+      inflight: 0,
+      graceUntil: null,
+      timer: null,
+      live: true,
+      migrationFromVm,
+    }
     book.set(index, seat)
     this.seats.set(key, seat)
     if (cap) this.noteCap(id, cap)
@@ -189,7 +211,14 @@ export class SeatPlanner {
       this.pump(seat.vmId)
       return
     }
-    if (seat.inflight === 0) this.armGrace(seat)
+    if (seat.inflight === 0) {
+      this.armGrace(seat)
+      if (seat.migrationRequested) {
+        for (const ticket of this.vmQueues.get(seat.vmId) || []) {
+          if (ticket.seatKey === seat.seatKey) ticket.wake?.()
+        }
+      }
+    }
     this.pump(seat.vmId)
   }
 
@@ -204,6 +233,7 @@ export class SeatPlanner {
    */
   armGrace(seat) {
     if (!seat?.live || seat.inflight !== 0 || seat.timer) return
+    if (seat.migrationRequested && this.queuedOn(seat)) return
     if (!(this.graceMs > 0)) {
       this.free(seat)
       return
@@ -266,7 +296,11 @@ export class SeatPlanner {
     const seat = vmId ? this.seatOf(seatKey) : null
     // A timeout never calls release. Rearm grace once this VM's queue is empty
     // so the seat does not stay taken after the device gave up.
-    if (seat?.vmId === vmId) this.armGrace(seat)
+    if (seat?.vmId === vmId) {
+      seat.migrationRequested = false
+      this.armGrace(seat)
+      this.pump(vmId)
+    }
     this.changed()
   }
 
@@ -319,7 +353,7 @@ export class SeatPlanner {
     const deadline = Date.now() + this.stickyWaitMs()
     for (const ticket of moved) {
       this.place(ticket, { kind: 'conc', vmId })
-      ticket.deadline = deadline
+      ticket.deadline = Math.min(ticket.totalDeadline ?? ticket.deadline, deadline)
       if (!ticket.granted) ticket.wake?.()
     }
     if (moved.length) this.pump(vmId)
@@ -356,14 +390,16 @@ export class SeatPlanner {
   pumpOne(vmId) {
     for (const kind of ['conc', 'seat']) {
       for (const ticket of [...(this.vmQueues.get(vmId) || [])]) {
-        if (!ticket.queued || ticket.kind !== kind) continue
+        if (!ticket.queued || ticket.kind !== kind || ticket.paused?.()) continue
         if (!this.grant(ticket, vmId)) break
       }
     }
     for (const ticket of [...this.globalQueue]) {
       if (!ticket.queued || !ticket.accepts(vmId)) continue
-      // A refusal specific to this ticket (model cap, refreshed gate) keeps its place.
-      this.grant(ticket, vmId)
+      // The oldest waiter picks from all ready VMs using the configured strategy.
+      for (const target of ticket.preferredVmIds?.() || [vmId]) {
+        if (ticket.accepts(target) && this.grant(ticket, target)) break
+      }
     }
   }
 

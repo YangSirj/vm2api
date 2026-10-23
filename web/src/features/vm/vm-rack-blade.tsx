@@ -21,6 +21,7 @@ import {
   vmFailedAt,
 } from '@/lib/vm-status'
 import { vmTotalCost, vmTotalTokens } from '@/lib/vm-usage'
+import { SeatCells } from '@/components/scheduler-viz'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import { runtimeTypeLabel, runtimeTypeOf } from '@/features/vm/machine-spec'
@@ -36,6 +37,7 @@ import {
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
 import { VmIpPoolSummary } from '@/features/vm/vm-ip-pool-summary'
+import { VmMemoryUsage } from '@/features/vm/vm-memory-usage'
 import { useVmPerms } from '@/features/vm/vm-perms'
 import {
   bladeState,
@@ -121,10 +123,7 @@ export function BladeControls({
   )
 }
 
-/**
- * 席位容量：一条按「已用 / 设置上限」缩放的定宽条，取代逐格画席位。
- * 上限可设到 20，逐格画会把底栏撑出卡片；容量条宽度与上限无关。
- */
+/** 席位与详情使用同一套方格，运行、排队和空余读数放在第二排。 */
 export function VmSeats({
   vm,
   compact = false,
@@ -137,49 +136,39 @@ export function VmSeats({
   const max = Number(vm.seats_max) || 0
   const grace = Math.min(used, Number(vm.seats_grace) || 0)
   const queued = Number(vm.queue_depth) || 0
-  const share = (n: number) => (max > 0 ? Math.min(100, (n / max) * 100) : 0)
-  const active = share(used - grace)
+  const running = Number(vm.inflight) || 0
+  const free = Math.max(0, max - used)
   return (
-    <span
-      className='inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap'
-      title={seatTitle(vm)}
+    <div
+      className='min-w-0 space-y-1 text-[10.5px] text-muted-foreground tabular-nums'
+      title={`${seatTitle(vm)} · 运行 ${running} 个请求 · 空余 ${free} 席。实心为占用、浅色为宽限保留、灰色为空闲；同一席位可承载多个请求。`}
     >
-      {compact ? null : <span>席位</span>}
-      <span
-        aria-hidden='true'
-        className={cn(
-          'relative h-1.5 shrink-0 overflow-hidden rounded-full track-recessed',
-          compact ? 'w-7' : 'w-12'
-        )}
-      >
-        <i
-          className='absolute inset-y-0 left-0 bg-primary motion-safe:transition-[width] motion-safe:duration-300'
-          style={{ width: `${active}%` }}
-        />
-        <i
-          className='absolute inset-y-0 bg-primary/35'
-          style={{ left: `${active}%`, width: `${share(grace)}%` }}
-        />
-      </span>
-      <span className='tabular-nums'>
-        <b
-          className={cn(
-            'font-semibold',
-            max > 0 && used >= max
-              ? 'text-[color:var(--status-caution)]'
-              : 'text-foreground'
-          )}
+      <div className='flex min-w-0 items-center justify-between gap-2'>
+        <span className='shrink-0'>席位</span>
+        <div
+          className={cn('max-w-[127px] min-w-0', compact && 'max-w-[107px]')}
         >
-          {used}
-        </b>
-        /{max}
-      </span>
-      {queued ? (
-        <span className='font-medium text-[color:var(--status-warn)] tabular-nums'>
-          {compact ? `+${queued}` : `排队 ${queued}`}
+          <SeatCells
+            used={used}
+            grace={grace}
+            max={max}
+            size={compact ? 'sm' : 'md'}
+            className='justify-end'
+          />
+        </div>
+      </div>
+      <div className='flex justify-end gap-x-2 whitespace-nowrap'>
+        <span className={running ? 'text-primary' : undefined}>
+          运行 {running}
         </span>
-      ) : null}
-    </span>
+        <span
+          className={queued ? 'text-[color:var(--status-warn)]' : undefined}
+        >
+          排队 {queued}
+        </span>
+        <span>空余 {free}</span>
+      </div>
+    </div>
   )
 }
 
@@ -464,9 +453,15 @@ export const VmBlade = memo(function VmBlade({
           />
         ) : null}
       </div>
-      <div className='min-w-0 space-y-1'>
-        <SpecLine vm={vm} />
-        <VmIpPoolSummary vmId={vm.id} />
+      <div className='grid min-w-0 grid-cols-2 items-start gap-3'>
+        <div className='min-w-0 space-y-1'>
+          <SpecLine vm={vm} />
+          <VmIpPoolSummary vmId={vm.id} />
+        </div>
+        <div className='min-w-0 space-y-2'>
+          <VmMemoryUsage vm={vm} />
+          <VmSeats vm={vm} />
+        </div>
       </div>
       {state === 'live' ? (
         <BladeUsage vm={vm} accounts={accounts} now={now} />
@@ -479,7 +474,6 @@ export const VmBlade = memo(function VmBlade({
         <BladeCallout vm={vm} accounts={accounts} state={state} />
       )}
       <div className='hairline-t flex min-h-9 min-w-0 items-center gap-2 pt-1.5 text-[11.5px] text-muted-foreground'>
-        <VmSeats vm={vm} />
         <BladeControls vm={vm} />
       </div>
     </article>

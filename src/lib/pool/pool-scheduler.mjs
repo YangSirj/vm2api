@@ -69,6 +69,8 @@ const QUEUE_REFRESH_MS = 2000
 export const DEFAULT_POOL_ROUTING = Object.freeze({
   strategy: 'balanced',
   queue_max: 50,
+  queue_wait_timeout_ms: 30000,
+  seat_migration_wait_ms: 10000,
   seat_grace_ms: 30000,
   seat_budget_reserve_pct: 0.02,
   fallback_wait_timeout_ms: 30000,
@@ -122,6 +124,14 @@ export function normalizePoolRouting(pool = {}) {
   next.fallback_wait_timeout_ms = clampWaitTimeoutMs(
     next.fallback_wait_timeout_ms,
     DEFAULT_POOL_ROUTING.fallback_wait_timeout_ms,
+  )
+  next.queue_wait_timeout_ms = clampWaitTimeoutMs(
+    next.queue_wait_timeout_ms,
+    DEFAULT_POOL_ROUTING.queue_wait_timeout_ms,
+  )
+  next.seat_migration_wait_ms = clampWaitTimeoutMs(
+    next.seat_migration_wait_ms,
+    DEFAULT_POOL_ROUTING.seat_migration_wait_ms,
   )
   // UnitCircuit used to read 0 / junk as its default; store that default so the
   // panel shows the value that actually runs.
@@ -363,11 +373,30 @@ export class PoolScheduler extends EventEmitter {
    * keyless callers keep the direct pick-and-wait path.
    */
   async selectAndReserve(args = {}) {
-    const pinned = !!String(args.pinVmId || '').trim()
-    if (args.seatKey && !pinned && !args.skipSessionSlot) {
-      return this.selectSeat({ ...args, seatKey: scopedSeatKey(args.seatKey, args.ownerScope) })
+    const started = Date.now()
+    const queueBudget = args.queueBudget
+    const remaining = Math.max(0, Number(queueBudget?.remainingMs ?? this.config.queue_wait_timeout_ms))
+    const deadline = Math.min(Number(args.deadline) || Infinity, started + remaining)
+    const selection = { ...args, deadline }
+    try {
+      if (remaining <= 0 && args.allowWait !== false) {
+        return {
+          ok: false,
+          code: 'no_available_accounts',
+          reason: 'pool_queue_timeout',
+          waitMs: 0,
+          retry_after_ms: 1000,
+        }
+      }
+      const pinned = !!String(args.pinVmId || '').trim()
+      if (args.seatKey && !pinned && !args.skipSessionSlot) {
+        return await this.selectSeat({ ...selection, seatKey: scopedSeatKey(args.seatKey, args.ownerScope) })
+      }
+      return await this.selectDirect(selection)
+    } finally {
+      // Shared by one request across failover selections; model execution is excluded.
+      if (queueBudget) queueBudget.remainingMs = Math.max(0, remaining - (Date.now() - started))
     }
-    return this.selectDirect(args)
   }
 
   async selectDirect({
@@ -493,6 +522,8 @@ export class PoolScheduler extends EventEmitter {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
       const now = Date.now()
+      // A cooldown can expire while eligibility is being read; refresh instead of sleeping a full plan.
+      if (waitPool.some((candidate) => candidate.availableAt && candidate.availableAt <= now)) continue
       const wakeAts = waitPool.map((candidate) => Number(candidate.availableAt) || 0).filter((value) => value > now)
       const concurrencyWait = waitPool.some((candidate) => candidate.busy && stickyShouldWait(candidate.waitReason))
       const waitPlan = this.resolveWaitPlan({
@@ -527,8 +558,8 @@ export class PoolScheduler extends EventEmitter {
   }
 
   /**
-   * Seat path (R1–R7). A seated device rides its seat and waits for VM
-   * concurrency in that VM's FIFO, never on another VM. A new device takes a
+   * Seat path. A conversation waits on its VM before a bounded, drained
+   * migration to another eligible VM. A new conversation takes a
    * free seat (sticky VM first, then strategy) or queues in arrival order:
    * on its sticky VM until `sticky_wait_timeout_ms`, then globally until
    * `fallback_wait_timeout_ms`. A seated device's concurrency wait times out
@@ -546,6 +577,8 @@ export class PoolScheduler extends EventEmitter {
     deadline = null,
     allowWait = true,
     familyVmId = null,
+    familyKey = null,
+    allowSeatMigration = true,
     deviceVmId = null,
     ownerScope = PLATFORM_SCOPE,
     keyScope = null,
@@ -553,7 +586,7 @@ export class PoolScheduler extends EventEmitter {
   } = {}) {
     const startedAt = Date.now()
     const failoverDeadline = Number(deadline) || Number.POSITIVE_INFINITY
-    const familyVm = familyVmId ? String(familyVmId).trim() : ''
+    let familyVm = familyVmId ? String(familyVmId).trim() : ''
     const deviceVm = deviceVmId ? String(deviceVmId).trim() : ''
     const avoided = (candidate) => !!avoid?.size && (avoid.has(candidate.accountId) || avoid.has(candidate.vmId))
     let stickyCleared = false
@@ -570,7 +603,7 @@ export class PoolScheduler extends EventEmitter {
         code: 'no_available_accounts',
         waitMs,
         familyGated,
-        retry_after_ms: this.planner.retryAfterMs(candidates.map((candidate) => candidate.vmId)),
+        retry_after_ms: this.planner.retryAfterMs(candidates.map((candidate) => candidate.vmId)) ?? 1000,
         ...selectionSnapshot(candidates, available, { reason, waitMs, stickyCleared }),
       }
     }
@@ -581,7 +614,8 @@ export class PoolScheduler extends EventEmitter {
         ...granted.reservation,
         selectionReason: granted.selectionReason,
         seatKey,
-        seatMoved: seatMoved && granted.seatOpened,
+        seatMoved: !!granted.migrationFromVm || (seatMoved && granted.seatOpened),
+        migrationFromVm: granted.migrationFromVm || null,
         familyGated,
         stickyCleared,
         waitMs: Date.now() - startedAt,
@@ -596,6 +630,8 @@ export class PoolScheduler extends EventEmitter {
         // A grant can land while eligibility was being re-read.
         if (ticket?.granted) return finish(ticket.granted)
         if (familyVm && !candidates.some((candidate) => candidate.vmId === familyVm)) familyGated = true
+        const movedSeat = this.planner.seatOf(seatKey)
+        if (movedSeat?.migrationFromVm) familyVm = movedSeat.vmId
         const sticky = this.reconcileSticky({
           stickyKey,
           stickyKeys,
@@ -607,6 +643,7 @@ export class PoolScheduler extends EventEmitter {
         const byVm = new Map(candidates.map((candidate) => [candidate.vmId, candidate]))
         if (ticket) ticket.candidates = byVm
         const now = Date.now()
+        if (allowWait && now >= failoverDeadline) return fail('pool_queue_timeout')
         // Home left the pool (circuit open, unschedulable, hard cooldown, removed).
         // A full home is still a candidate, so that wait keeps its sticky clock.
         if (ticket?.kind === 'seat' && ticket.vmId && !byVm.has(ticket.vmId)) {
@@ -640,16 +677,22 @@ export class PoolScheduler extends EventEmitter {
               kind: 'conc',
               vmId: seat.vmId,
               candidates: byVm,
+              totalDeadline: failoverDeadline,
               deadline: Math.min(failoverDeadline, now + this.config.sticky_wait_timeout_ms),
             })
           } else if (ticket.kind !== 'conc' || ticket.vmId !== seat.vmId) {
             this.planner.place(ticket, { kind: 'conc', vmId: seat.vmId })
           }
+          ticket.bindingKeys = [stickyKey, ...(stickyKeys || []), familyKey].filter(Boolean)
+          ticket.canMigrate = allowSeatMigration && !ticket.migrated
+          this.migrateWaitingSeat(ticket, candidates, avoided)
           this.planner.pump(seat.vmId)
         } else {
-          const stickyVms = [familyGated ? '' : familyVm, deviceVm, sticky.vmId || ''].filter(Boolean)
+          const deviceFallback = seatKey.includes('|seat:dev:') ? deviceVm : ''
+          const sessionHome = (familyGated ? '' : familyVm) || sticky.vmId || ''
+          const stickyVms = [sessionHome, deviceFallback].filter(Boolean)
           if (!ticket) {
-            const granted = this.openNewSeat(seatKey, candidates, { avoided, stickyVms })
+            const granted = this.openNewSeat(seatKey, candidates, { avoided, stickyVms, waitForHome: !!sessionHome })
             if (granted) return finish(granted)
             if (!candidates.length) {
               const empty = emptyPoolFailure(model, candidates)
@@ -665,7 +708,14 @@ export class PoolScheduler extends EventEmitter {
                   kind: 'seat',
                   vmId: home.vmId,
                   candidates: byVm,
-                  stickyUntil: Math.min(failoverDeadline, now + this.config.sticky_wait_timeout_ms),
+                  totalDeadline: failoverDeadline,
+                  stickyUntil: Math.min(
+                    failoverDeadline,
+                    now +
+                      (sessionHome && allowSeatMigration
+                        ? this.config.seat_migration_wait_ms
+                        : this.config.sticky_wait_timeout_ms),
+                  ),
                   deadline: failoverDeadline,
                 })
               : this.enqueueTicket({
@@ -673,6 +723,7 @@ export class PoolScheduler extends EventEmitter {
                   kind: 'global',
                   vmId: null,
                   candidates: byVm,
+                  totalDeadline: failoverDeadline,
                   deadline: Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms),
                 })
           } else if (ticket.kind === 'conc') {
@@ -680,10 +731,18 @@ export class PoolScheduler extends EventEmitter {
             this.planner.place(ticket, { kind: 'global', vmId: null })
             ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
           }
+          ticket.bindingKeys = [stickyKey, ...(stickyKeys || []), familyKey].filter(Boolean)
+          ticket.originVmId ||= sessionHome || null
           for (const vmId of ticket.vmId ? [ticket.vmId] : byVm.keys()) this.planner.pump(vmId)
         }
         if (ticket.granted) return finish(ticket.granted)
-        const until = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
+        const migrationAt = ticket.enqueuedAt + this.config.seat_migration_wait_ms
+        const until =
+          ticket.kind === 'seat'
+            ? ticket.stickyUntil
+            : !ticket.migrationDue && ticket.canMigrate
+              ? Math.min(ticket.deadline, migrationAt + 1)
+              : ticket.deadline
         await this.waitTicket(ticket, { signal, until: Math.min(until, Date.now() + QUEUE_REFRESH_MS) })
         if (ticket.granted) return finish(ticket.granted)
         const after = Date.now()
@@ -712,26 +771,88 @@ export class PoolScheduler extends EventEmitter {
         !avoided(candidate) &&
         this.isReservable(candidate) &&
         this.planner.canOpen(candidate.vmId, candidate.seatCap, candidate.headroom) &&
-        !this.planner.hasSeatWaiters(candidate.vmId),
+        !this.planner.hasSeatWaiters(candidate.vmId) &&
+        !this.planner.hasConcWaiters(candidate.vmId),
     )
     const open = openable.filter((candidate) => !candidate.draining)
     return open.length ? open : openable
   }
 
-  /** Sticky VMs first (family, device, session), then the configured strategy. */
-  openNewSeat(seatKey, candidates, { avoided, stickyVms = [] }) {
+  /** Existing family/session first; new independent sessions follow the strategy. */
+  openNewSeat(seatKey, candidates, { avoided, stickyVms = [], waitForHome = false }) {
     const openable = this.openableCandidates(candidates, avoided)
     if (!openable.length) return null
     for (const vmId of stickyVms) {
       const home = openable.find((candidate) => candidate.vmId === vmId)
       const granted = home ? this.claimSeat(seatKey, home, 'sticky') : null
       if (granted) return granted
+      if (waitForHome && candidates.some((candidate) => candidate.vmId === vmId)) return null
     }
-    for (const candidate of this.planner.rank(openable)) {
+    for (const candidate of this.rankNewSeats(openable)) {
       const granted = this.claimSeat(seatKey, candidate, this.planner.strategy)
       if (granted) return granted
     }
     return null
+  }
+
+  /** Move only unstarted work, after this task family has completely drained. */
+  migrateWaitingSeat(ticket, candidates, avoided = () => false) {
+    const seat = this.planner.seatOf(ticket.seatKey)
+    if (!seat || ticket.kind !== 'conc') return false
+    const waiting = (this.planner.vmQueues.get(seat.vmId) || []).filter((x) => x.seatKey === seat.seatKey && x.queued)
+    if (waiting[0] !== ticket) return false
+    const due = Date.now() - ticket.enqueuedAt >= this.config.seat_migration_wait_ms
+    ticket.migrationDue = due
+    if (!due || waiting.some((x) => x.canMigrate === false)) {
+      seat.migrationRequested = false
+      return false
+    }
+    const targets = this.openableCandidates(
+      candidates.filter((x) => x.vmId !== seat.vmId),
+      avoided,
+    ).filter((target) => waiting.every((x) => x.candidates.has(target.vmId)))
+    seat.migrationRequested = targets.length > 0
+    if (!seat.migrationRequested || seat.inflight > 0) return false
+    for (const target of this.rankNewSeats(targets)) {
+      // Reserve first. A competing request cannot steal this capacity between detach/open.
+      const reservation = this.reserve(target)
+      if (!reservation) continue
+      try {
+        const keys = new Set(waiting.flatMap((x) => x.bindingKeys || []))
+        for (const key of keys) {
+          const bound = this.stickyRouter?.resolve?.(key)
+          if (bound?.vmId === seat.vmId) this.stickyRouter.rebindFamily?.(key, target)
+        }
+      } catch (error) {
+        reservation.release()
+        seat.migrationRequested = false
+        throw error
+      }
+      const previousVm = seat.vmId
+      for (const pending of waiting) pending.migrated = true
+      this.planner.detachSeat(seat)
+      // Remove this ticket before opening; open() rehomes the remaining family tickets.
+      this.planner.unlink(ticket)
+      ticket.granted = this.attachSeatReservation(ticket.seatKey, target, reservation, 'seat-migrated', previousVm)
+      ticket.wake?.()
+      this.planner.pump(previousVm)
+      return true
+    }
+    seat.migrationRequested = false
+    return false
+  }
+
+  rankNewSeats(candidates) {
+    return this.planner.rank(
+      candidates.map((candidate) => {
+        const effective = candidate.draining ? Math.min(1, candidate.maxConcurrency) : candidate.maxConcurrency
+        const queued = this.waiterCount(candidate.accountId) + (this.planner.vmQueues.get(candidate.vmId)?.length || 0)
+        return {
+          ...candidate,
+          loadRatio: ((this.inflight.get(candidate.accountId) || 0) + queued) / Math.max(1, effective),
+        }
+      }),
+    )
   }
 
   /**
@@ -739,16 +860,37 @@ export class PoolScheduler extends EventEmitter {
    * the seat land together or not at all. The device's existing seat must be
    * on this VM; otherwise a new one opens only under cap and budget.
    */
-  claimSeat(seatKey, candidate, selectionReason) {
+  claimSeat(seatKey, candidate, selectionReason, migration = null) {
     if (!candidate || !grantable(candidate)) return null
     const current = this.planner.seatOf(seatKey)
-    if (current && current.vmId !== candidate.vmId) return null
+    if (current && (current.vmId !== candidate.vmId || current.migrationRequested)) return null
     if (!current && !this.planner.canOpen(candidate.vmId, candidate.seatCap, candidate.headroom)) return null
     const reservation = this.reserve(candidate)
     if (!reservation) return null
+    if (migration && !current) {
+      try {
+        for (const key of migration.keys || []) {
+          if (this.stickyRouter?.resolve?.(key)?.vmId === migration.from)
+            this.stickyRouter.rebindFamily?.(key, candidate)
+        }
+      } catch (error) {
+        reservation.release()
+        throw error
+      }
+    }
+    return this.attachSeatReservation(seatKey, candidate, reservation, selectionReason, migration?.from)
+  }
+
+  attachSeatReservation(seatKey, candidate, reservation, selectionReason, migrationFromVm = null) {
+    const current = this.planner.seatOf(seatKey)
     const seat =
       current ||
-      this.planner.open(seatKey, { vmId: candidate.vmId, accountId: candidate.accountId, cap: candidate.seatCap })
+      this.planner.open(seatKey, {
+        vmId: candidate.vmId,
+        accountId: candidate.accountId,
+        cap: candidate.seatCap,
+        migrationFromVm,
+      })
     this.planner.hold(seat)
     const releaseRequest = reservation.release
     let released = false
@@ -756,6 +898,7 @@ export class PoolScheduler extends EventEmitter {
       candidate,
       selectionReason,
       seatOpened: !current,
+      migrationFromVm: seat.migrationFromVm || null,
       reservation: {
         ...reservation,
         slotIndex: seat.index,
@@ -769,7 +912,7 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
-  enqueueTicket({ seatKey, kind, vmId, candidates, deadline, stickyUntil = null }) {
+  enqueueTicket({ seatKey, kind, vmId, candidates, deadline, totalDeadline = deadline, stickyUntil = null }) {
     if (this.queuedTotal() >= this.config.queue_max) throw this.queueFullError([...candidates.keys()])
     const ticket = {
       seatKey,
@@ -777,15 +920,41 @@ export class PoolScheduler extends EventEmitter {
       vmId,
       candidates,
       deadline,
+      totalDeadline,
       stickyUntil,
       enqueuedAt: Date.now(),
       queued: false,
+      canMigrate: false,
       granted: null,
+      paused: () => !!this.planner.seatOf(seatKey)?.migrationRequested,
       wake: null,
       accepts: (id) => ticket.kind === 'global' && ticket.candidates.has(id),
       vmIds: () => [...ticket.candidates.keys()],
+      preferredVmIds: () => {
+        const ready = [...ticket.candidates.values()].filter(
+          (candidate) =>
+            grantable(candidate) &&
+            !this.planner.vmQueues.get(candidate.vmId)?.length &&
+            this.planner.canOpen(candidate.vmId, candidate.seatCap, candidate.headroom),
+        )
+        const open = ready.filter((candidate) => !candidate.draining)
+        return this.rankNewSeats(open.length ? open : ready).map((candidate) => candidate.vmId)
+      },
       tryGrant: (id) => {
-        const granted = this.claimSeat(ticket.seatKey, ticket.candidates.get(id), 'queued')
+        if (Date.now() >= ticket.deadline) return false
+        const migration =
+          ticket.kind === 'global' &&
+          ticket.originVmId &&
+          ticket.originVmId !== id &&
+          !this.planner.seatOf(ticket.seatKey)
+            ? { from: ticket.originVmId, keys: ticket.bindingKeys }
+            : null
+        const granted = this.claimSeat(
+          ticket.seatKey,
+          ticket.candidates.get(id),
+          migration ? 'seat-migrated' : 'queued',
+          migration,
+        )
         if (!granted) return false
         ticket.granted = granted
         return true
@@ -936,7 +1105,9 @@ export class PoolScheduler extends EventEmitter {
         headroom: eligibility.headroom ?? null,
         draining: eligibility.gateZone === GATE_DRAINING,
         account: eligibility.account || null,
-        loadRatio: (inflight + this.waiterCount(accountId)) / maxConcurrency,
+        loadRatio:
+          (inflight + this.waiterCount(accountId) + (this.planner.vmQueues.get(vm.id)?.length || 0)) /
+          (eligibility.gateZone === GATE_DRAINING ? Math.min(1, maxConcurrency) : maxConcurrency),
         lastUsedAt: this.lastUsed.get(accountId) || state?.last_used_at || 0,
         workerStatus: eligibility.workerStatus,
         busy: !!eligibility.busy,
@@ -1570,8 +1741,10 @@ export class PoolScheduler extends EventEmitter {
 
   isReservable(candidate) {
     if (!candidate) return false
-    const inflight = candidate.inflight || 0
-    const conc = Number(candidate.maxConcurrency) || 0
+    const inflight = this.inflight.get(candidate.accountId) || 0
+    const conc = candidate.draining
+      ? Math.min(1, Number(candidate.maxConcurrency) || 0)
+      : Number(candidate.maxConcurrency) || 0
     if (conc > 0 && inflight >= conc) return false
     if (!candidate.busy) return true
     return candidate.waitReason === 'slot_busy'

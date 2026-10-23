@@ -70,7 +70,7 @@ x-api-key: sk-vm-…
 | `content-type: application/json` | 必填 |
 | `x-session-id` / `x-conversation-id` / `x-claude-code-session-id` | sticky 键（见 `routing.sticky`） |
 | 交付模式 `verified` | 缓冲到 `message_stop` 再回放 |
-| 缓存 TTL `1h` | Node 新增点的缺省值；`x-kin-cache-ttl: 5m` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
+| `x-kin-cache-ttl: 5m` / `1h` | 重写请求优先采用请求头，其次请求体缓存标记的 TTL；`{type:"ephemeral"}` 省略 `ttl` 表示 5m，也会覆盖旧会话值，模板与消息标记一起跟随。完全没有缓存标记时才沿用会话值或后台默认值。native 官方透传保留 caller 断点及 TTL |
 | 调试开关 | 单请求日志模式 |
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |

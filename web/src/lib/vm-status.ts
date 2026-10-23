@@ -268,7 +268,7 @@ export function seatTitle(vm: Vm): string {
   const grace = Number(vm.seats_grace) || 0
   const queued = Number(vm.queue_depth) || 0
   const conc = Number(vm.conc_waiting) || 0
-  const parts = [`席位 ${used}/${Number(vm.seats_max) || 0}`]
+  const parts = [`会话席位 ${used}/${Number(vm.seats_max) || 0}`]
   if (grace) parts.push(`宽限保留 ${grace}`)
   if (queued) parts.push(`排队 ${queued}${conc ? `（等并发 ${conc}）` : ''}`)
   return parts.join(' · ')

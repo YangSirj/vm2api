@@ -408,6 +408,13 @@ export type Vm = {
   /** 最近一次刷票失败的原因。与 `last_probe.error` 是两条独立的失效来源。 */
   refresh_error?: string
   extra_usage?: unknown
+  memory_usage?: {
+    status: 'ok' | 'stopped' | 'unavailable' | 'unsupported'
+    used_bytes: number | null
+    /** 0 means no Docker hard limit. */
+    limit_bytes: number | null
+    sampled_at: string
+  } | null
   runtime?: Record<string, unknown>
   fingerprint?: Record<string, unknown>
   worker_credential?: Record<string, unknown>

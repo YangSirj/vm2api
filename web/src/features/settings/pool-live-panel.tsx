@@ -44,10 +44,15 @@ function headroomOf(vm: Vm): number | null {
 }
 
 /**
- * 按草稿策略复现 rankSeatCandidates 的顺序：调度等级降序 → 占用比例
- * （平衡升序 / 填充降序）→ 余量降序 → id。并发、RPM 和预算闸不在这里判，
- * 所以只是预估。
+ * 按草稿策略预估排序：填充优先席位密度，平衡优先请求负载。
+ * 额度余量分别升序/降序；RPM、模型与调用方范围仍由后端实时判定。
  */
+function effectiveConcurrency(vm: Vm): number {
+  const cap = Number(vm.max_concurrency) || 0
+  const draining = vm.availability?.key === 'drain'
+  return draining ? Math.min(1, cap) : cap
+}
+
 export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
   const fill = strategy === 'fill'
   const rows: SeatRow[] = vms
@@ -57,6 +62,11 @@ export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
       const max = Number(vm.seats_max) || 0
       const inPool = scheduleStateLabel(vm) === '开'
       const full = used >= max
+      const cap = effectiveConcurrency(vm)
+      const busy =
+        cap <= 0 ||
+        (Number(vm.inflight) || 0) >= cap ||
+        (Number(vm.queue_depth) || 0) > 0
       return {
         vm,
         used,
@@ -65,7 +75,13 @@ export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
         queued: Number(vm.queue_depth) || 0,
         concWaiting: Number(vm.conc_waiting) || 0,
         rank: null,
-        why: !inPool ? `调度${scheduleStateLabel(vm)}` : full ? '已满' : null,
+        why: !inPool
+          ? `调度${scheduleStateLabel(vm)}`
+          : full
+            ? '席位已满'
+            : busy
+              ? '并发忙碌或排队中'
+              : null,
       }
     })
   const open = rows
@@ -75,11 +91,21 @@ export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
         (Number(b.vm.schedule_level) || 0) - (Number(a.vm.schedule_level) || 0)
       if (priority) return priority
       const occ = a.used / a.max - b.used / b.max
-      if (occ) return fill ? -occ : occ
-      const room =
-        (headroomOf(b.vm) ?? Number.POSITIVE_INFINITY) -
-        (headroomOf(a.vm) ?? Number.POSITIVE_INFINITY)
-      if (room && Number.isFinite(room)) return room
+      const load =
+        (Number(a.vm.inflight) || 0) / Math.max(1, effectiveConcurrency(a.vm)) -
+        (Number(b.vm.inflight) || 0) / Math.max(1, effectiveConcurrency(b.vm))
+      if (fill) {
+        if (occ) return -occ
+        if (load) return -load
+      } else {
+        if (load) return load
+        if (occ) return occ
+      }
+      const ah = headroomOf(a.vm)
+      const bh = headroomOf(b.vm)
+      if (ah != null && bh == null) return -1
+      if (ah == null && bh != null) return 1
+      if (ah != null && bh != null && ah !== bh) return fill ? ah - bh : bh - ah
       return a.vm.id.localeCompare(b.vm.id)
     })
   open.forEach((row, i) => {
@@ -167,7 +193,7 @@ export function PoolLivePanel({
     <PaneSection
       icon={Activity}
       title='实时态势'
-      desc='Claude 预调度：一台设备在一台 VM 上占一个席位，同设备的并发请求共用席位；席位满了按到达顺序排队。'
+      desc='Claude 预调度：一个独立会话或父子任务组占一个席位，同组请求共用席位；同设备的不同会话可以分开；席位满了按到达顺序排队。'
       aside={
         <span className='inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground'>
           <Radio
@@ -239,7 +265,7 @@ export function PoolLivePanel({
                   label='全局排队'
                   value={globalDepth}
                   tone={globalDepth ? 'warn' : undefined}
-                  hint='还没落到任何 VM、在等新席位的设备'
+                  hint='还没落到任何 VM、在等新席位的会话'
                 />
                 <Kpi
                   label='排队总量 / 上限'

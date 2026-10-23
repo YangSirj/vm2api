@@ -584,7 +584,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
               {codex ? null : (
                 <KnobRow
                   label='席位上限'
-                  desc='本 VM 同时能绑定的设备数；同设备的并发请求共用一个席位。'
+                  desc='本 VM 同时能绑定的独立会话或父子任务组数；同组并发请求共用一个席位。'
                   inheritedText={String(inherited?.session_slots ?? '—')}
                   own={draft.seats.own}
                   onOwnChange={(own) =>

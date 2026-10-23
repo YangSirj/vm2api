@@ -33,16 +33,48 @@ test('header overrides routing default', () => {
   assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: { cache_ttl: '5m' } } }), '5m')
 })
 
-test('ttl-less markers (official Claude Code) take the settings menu value', () => {
+test('ttl-less ephemeral markers mean the caller selected Anthropic default 5m', () => {
   const body = {
     system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }],
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }],
   }
-  assert.equal(resolveCacheTtl({ headers: {}, body, routing: { compatibility: { cache_ttl: '1h' } } }), '1h')
+  assert.equal(resolveCacheTtl({ headers: {}, body, routing: { compatibility: { cache_ttl: '1h' } } }), '5m')
   assert.equal(resolveCacheTtl({ headers: {}, body, routing: { compatibility: { cache_ttl: '5m' } } }), '5m')
   const out = applyCacheTtlToBody(body, '1h')
   assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
+
+test('implicit 5m works at every marker location and overrides a warm 1h conversation', () => {
+  clearConversationCacheTtls()
+  const common = { conversationKey: 'implicit-five-minute-switch', routing: { compatibility: { cache_ttl: '1h' } } }
+  const marker = { type: 'ephemeral' }
+  const bodies = [
+    { cache_control: marker },
+    { tools: [{ name: 'Read', cache_control: marker }] },
+    { system: [{ type: 'text', text: 's', cache_control: marker }] },
+    { messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: marker }] }] },
+  ]
+  for (const [i, body] of bodies.entries()) {
+    const now = 1_000_000 + i * 10_000
+    assert.equal(resolveCacheTtl({ ...common, headers: { 'x-kin-cache-ttl': '1h' }, now }), '1h')
+    assert.equal(resolveCacheTtl({ ...common, body, now: now + 1000 }), '5m')
+    assert.equal(resolveCacheTtl({ ...common, body, headers: { 'x-kin-cache-ttl': '1h' }, now: now + 2000 }), '1h')
+  }
+  assert.equal(
+    resolveCacheTtl({ body: { system: [{ type: 'text', text: 'uncached' }] }, routing: common.routing }),
+    '1h',
+    'no marker still uses the admin default',
+  )
+  assert.equal(
+    resolveCacheTtl({
+      body: { cache_control: { type: 'ephemeral', ttl: '1h' }, ...bodies[2] },
+      routing: common.routing,
+    }),
+    '1h',
+    'mixed TTLs retain the highest selected duration',
+  )
+  clearConversationCacheTtls()
 })
 
 test('owned TTL completion preserves explicit mixed TTLs and scope without mutating input', () => {
@@ -120,6 +152,24 @@ test('explicit inbound 5m or 1h overrides the console default', () => {
     }),
     '5m',
   )
+})
+
+test('explicit caller TTL updates a warm conversation and missing TTL keeps the latest choice', () => {
+  clearConversationCacheTtls()
+  const base = { conversationKey: 'caller-ttl-switch', routing: { compatibility: { cache_ttl: '1h' } } }
+  const t0 = 1_000_000
+  const marker = (ttl) => ({ system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral', ttl } }] })
+  assert.equal(resolveCacheTtl({ ...base, now: t0 }), '1h')
+  assert.equal(resolveCacheTtl({ ...base, body: marker('5m'), now: t0 + 1000 }), '5m')
+  assert.equal(resolveCacheTtl({ ...base, body: marker(undefined), now: t0 + 2000 }), '5m')
+  assert.equal(resolveCacheTtl({ ...base, body: marker('1h'), now: t0 + 3000 }), '1h')
+  assert.equal(
+    resolveCacheTtl({ ...base, headers: { 'x-kin-cache-ttl': '5m' }, body: marker('1h'), now: t0 + 4000 }),
+    '5m',
+  )
+  assert.equal(resolveCacheTtl({ ...base, now: t0 + 5000 }), '5m')
+  assert.equal(resolveCacheTtl({ ...base, now: t0 + 6 * 60_000 }), '1h', 'idle expiry returns to the default')
+  clearConversationCacheTtls()
 })
 
 test('stripIllegalCacheControlFields drops scope on system and tools', () => {

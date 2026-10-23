@@ -919,7 +919,7 @@ test('inbound session and device keys match across API keys at the protocol entr
   }
 })
 
-test('the protocol entry hands the device seat key to the pool, independent of the API key', async () => {
+test('the protocol entry separates conversations on one device without splitting a conversation by API key', async () => {
   const { dir, router } = realStickyRouter()
   try {
     const turn = {
@@ -933,11 +933,21 @@ test('the protocol entry hands the device seat key to the pool, independent of t
     const b = await captureRunOpts({
       body: sessionBody({ device_id: 'dev-seat', session_id: 'sess-other' }, turn),
       stickyRouter: router,
+      apiKeyRecord: { id: 'key-a', group_id: 1 },
+    })
+    const sameConversation = await captureRunOpts({
+      body: sessionBody({ device_id: 'dev-seat', session_id: 'sess-seat' }, turn),
+      stickyRouter: router,
       apiKeyRecord: { id: 'key-b', group_id: 1 },
     })
     assert.equal(a.skipSessionSeat, false)
-    assert.equal(a.seatKey, 'seat:dev:dev-seat')
-    assert.equal(b.seatKey, a.seatKey)
+    assert.equal(b.skipSessionSeat, false)
+    assert.equal(sameConversation.skipSessionSeat, false)
+    assert.equal(a.seatKey, 'seat:sess:sess-seat')
+    assert.equal(b.seatKey, 'seat:sess:sess-other')
+    assert.notEqual(b.seatKey, a.seatKey)
+    assert.equal(b.deviceKey, a.deviceKey)
+    assert.equal(sameConversation.seatKey, a.seatKey)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

@@ -270,17 +270,15 @@ function ephemeralCacheText(body = {}) {
 }
 
 /**
- * Pool seat identity: one key per inbound device; every request of it shares
- * one seat. Precedence (sub2api GenerateSessionHash without the API key):
- * device id → metadata session_id → short one-shot probe (no seat) →
- * hash of `cache_control: ephemeral` content → hash of client IP +
- * normalized UA + system + first user turn. The API key never takes part.
- * @returns {{ key: string|null, source: 'device'|'session'|'probe'|'cache'|'fingerprint' }}
+ * Independent conversations own seats. Explicit parent/root identity keeps
+ * a task family together; a device is only the fallback without a session.
+ * The scheduler adds the owner scope. API keys never define a conversation.
  */
-export function resolveSeatIdentity({ inbound = {}, body = {}, headers = {}, clientIp = '' } = {}) {
+export function resolveSeatIdentity({ inbound = {}, body = {}, headers = {}, clientIp = '', rootSessionId = '' } = {}) {
   const identity = resolveInboundIdentity({ inbound, body, headers })
+  const session = String(rootSessionId || rootCallerSession({ inbound, body, headers })).trim()
+  if (session) return { key: `seat:sess:${session}`, source: 'session' }
   if (identity.deviceId) return { key: `seat:dev:${identity.deviceId}`, source: 'device' }
-  if (identity.sessionId) return { key: `seat:sess:${identity.sessionId}`, source: 'session' }
   if (isShortProbeRequest(inbound)) return { key: null, source: 'probe' }
   const cached = ephemeralCacheText(inbound)
   if (cached) return { key: `seat:h:${seatHash(['cache', cached])}`, source: 'cache' }
