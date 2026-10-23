@@ -538,15 +538,23 @@ export class FailoverRunner {
   async run(args = {}) {
     const sessionKey = String(args.stickyKey || '')
     if (!sessionKey) return this.runOnce(args)
-    const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
+    const previous = this.sessionTails.get(sessionKey)
     let releaseTurn
     const turn = new Promise((resolve) => {
       releaseTurn = resolve
     })
-    const tail = previous.catch(() => {}).then(() => turn)
+    const tail = (previous || Promise.resolve()).catch(() => {}).then(() => turn)
     this.sessionTails.set(sessionKey, tail)
     try {
-      await waitForSessionTurn(previous, args.signal, this.config.session_queue_timeout_ms)
+      const finishWait =
+        previous && !args.signal?.aborted
+          ? this.scheduler?.trackSessionWait?.({ stickyKey: sessionKey, pinVmId: args.pinVmId })
+          : null
+      try {
+        await waitForSessionTurn(previous || Promise.resolve(), args.signal, this.config.session_queue_timeout_ms)
+      } finally {
+        finishWait?.()
+      }
       return await this.runOnce(args)
     } catch (error) {
       if (error?.code === 'request_cancelled') return clientCancelledResult()

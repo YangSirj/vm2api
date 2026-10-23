@@ -353,6 +353,8 @@ export class PoolScheduler extends EventEmitter {
     /** vmId → live reservations; mirrors `inflight` (per account) for the panel. */
     this.vmInflight = new Map()
     this.waiters = new Map()
+    // Display-only: these requests have not entered pool selection yet.
+    this.sessionWaiters = new Map()
     this.healthCache = new Map()
     this.lastUsed = new Map()
     this.cooldownTimers = new Map()
@@ -987,7 +989,7 @@ export class PoolScheduler extends EventEmitter {
     })
   }
 
-  /** Every Claude request waiting right now: seat queues plus cooldown / RPM / concurrency waiters. */
+  /** Requests subject to the pool queue limit; session serialization has its own timeout. */
   queuedTotal() {
     return this.planner.pending() + this.totalWaiters()
   }
@@ -1739,6 +1741,16 @@ export class PoolScheduler extends EventEmitter {
     return { ...perAccount, total: this.totalWaiters() }
   }
 
+  /** Count a same-session wait until its turn starts, times out, or is cancelled. */
+  trackSessionWait({ stickyKey, pinVmId = null }) {
+    const token = Symbol('session-wait')
+    this.sessionWaiters.set(token, { stickyKey, pinVmId })
+    this.emit('change')
+    return () => {
+      if (this.sessionWaiters.delete(token)) this.emit('change')
+    }
+  }
+
   isReservable(candidate) {
     if (!candidate) return false
     const inflight = this.inflight.get(candidate.accountId) || 0
@@ -2016,12 +2028,13 @@ export class PoolScheduler extends EventEmitter {
 
   /**
    * Seats, queues and live requests per VM for panel rows and the seat stream.
-   * `queue_depth` counts every request waiting on that VM (seat, concurrency,
-   * cooldown/RPM); `conc_waiting` is the concurrency share of it; `inflight`
+   * `queue_depth` counts every request waiting on that VM (session, seat,
+   * concurrency, cooldown/RPM); `conc_waiting` is the concurrency share; `inflight`
    * is requests holding a reservation on it right now (seatless and pinned too).
    */
   seatSnapshot() {
-    const { seats, global_queue_depth } = this.planner.snapshot()
+    const { seats, global_queue_depth: globalQueueDepth } = this.planner.snapshot()
+    let global_queue_depth = globalQueueDepth
     const row = (vmId) =>
       (seats[vmId] ||= {
         seats_used: 0,
@@ -2034,6 +2047,12 @@ export class PoolScheduler extends EventEmitter {
       for (const entry of bucket.values()) {
         if (entry?.vmId) row(entry.vmId).queue_depth += 1
       }
+    }
+    for (const entry of this.sessionWaiters.values()) {
+      // Resolve at read time: a quota failover can move the preceding turn.
+      const vmId = entry.pinVmId || this.stickyRouter?.resolve?.(entry.stickyKey)?.vmId
+      if (vmId) row(vmId).queue_depth += 1
+      else global_queue_depth += 1
     }
     for (const entry of Object.values(seats)) entry.inflight = 0
     for (const [vmId, count] of this.vmInflight) row(vmId).inflight = count
