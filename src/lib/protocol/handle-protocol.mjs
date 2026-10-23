@@ -93,6 +93,7 @@ import {
   extractFirstUserIdentity,
   outboundSessionMode,
   resolveInboundIdentity,
+  resolveTaskSession,
   resolveSeatIdentity,
   resolveOutboundSessionId,
   sessionIdFromOutboundBody,
@@ -924,7 +925,7 @@ export function createHandleProtocol(deps) {
     // sticky identity but never hold a session seat the main conversation needs.
     const seatless = isProbe || isShortProbeRequest(inbound)
     const parentSession = explicitParentSessionId(inbound, req.headers)
-    // One independent conversation / parent task per seat; device only as fallback.
+    // Each Claude Code agent owns a seat; parentage does not pin sibling agents.
     const seatKey = seatless
       ? null
       : resolveSeatIdentity({
@@ -947,7 +948,9 @@ export function createHandleProtocol(deps) {
     const stickyKey = sessionKeys.stickyKey || null
     const stickyKeys = sessionKeys.stickyKeys || []
     const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
-    const familySession = parentSession || callerSession
+    const familySession =
+      resolveTaskSession({ inbound, body: ctx.body, headers: req.headers, rootSessionId: parentSession }) ||
+      callerSession
     const familyTrusted =
       !!parentSession || (!!inboundIdentity.sessionId && familySession === inboundIdentity.sessionId)
     const familyKey = !familySession

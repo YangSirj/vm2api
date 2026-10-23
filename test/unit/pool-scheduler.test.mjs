@@ -13,6 +13,9 @@ import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
   applyCrsIdentityReplace,
   rebuildOutboundSession,
+  resolveInboundIdentity,
+  resolveSeatIdentity,
+  resolveTaskSession,
   resolveOutboundSessionId,
 } from '../../src/lib/identity/identity-rewrite.mjs'
 
@@ -2880,3 +2883,87 @@ test('a resting slot that cannot serve the model does not promise a Retry-After'
   assert.equal(selected.ok, false)
   assert.equal(selected.retry_after_ms, null)
 })
+
+for (const strategy of ['balanced', 'fill']) {
+  test(`Claude Code sibling agents run on free VMs with ${strategy} while their own turns stay serialized`, async (t) => {
+    const root = project()
+    const third = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-02.json'), 'utf8'))
+    third.id = 'vm-03'
+    third.claude.account_uuid = 'account-3'
+    fs.writeFileSync(path.join(root, 'vms', 'vm-03.json'), JSON.stringify(third))
+    for (const id of ['vm-01', 'vm-02', 'vm-03']) {
+      const file = path.join(root, 'vms', `${id}.json`)
+      const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+      vm.policy.maxConcurrency = 1
+      fs.writeFileSync(file, JSON.stringify(vm))
+    }
+    const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+    const pool = scheduler(root, { stickyRouter: sticky })
+    pool.reloadConfig({ strategy })
+    const runner = new FailoverRunner({ scheduler: pool, stickyRouter: sticky })
+    const gates = new Map()
+    const started = new Map()
+    const jobs = []
+    const body = {
+      model: 'claude-test',
+      metadata: { user_id: { session_id: 'shared-root', device_id: 'shared-device' } },
+      messages: [{ role: 'user', content: 'Implement the assigned module and explain the result.' }],
+    }
+    const run = (requestId, agent = '') => {
+      const headers = { 'x-claude-code-session-id': 'shared-root' }
+      if (agent) headers['x-claude-code-agent-id'] = agent
+      if (agent === 'b') headers['x-claude-code-parent-agent-id'] = 'a'
+      const args = { inbound: body, body, headers, rootSessionId: agent ? 'shared-root' : '' }
+      const req = { headers, apiKeyRecord: { id: 'test-key' } }
+      const identity = resolveInboundIdentity(args)
+      const keys = sticky.sessionPoolKeys(req, body, identity)
+      const familyKey = sticky.familyPoolKey(req, resolveTaskSession(args), { trusted: true })
+      const gate = Promise.withResolvers()
+      gates.set(requestId, gate)
+      const job = runner.run({
+        requestId,
+        canonicalBody: body,
+        model: body.model,
+        ...keys,
+        seatKey: resolveSeatIdentity(args).key,
+        familyKey,
+        familyVmId: sticky.resolve(familyKey)?.vmId || null,
+        deviceKey: sticky.canonicalDeviceKey(identity.deviceId),
+        callAttempt: async ({ candidate: selected }) => {
+          started.set(requestId, selected.vmId)
+          await gate.promise
+          return verifiedHop(requestId)
+        },
+      })
+      jobs.push(job)
+      return job
+    }
+    const until = async (predicate) => {
+      for (let i = 0; i < 200 && !predicate(); i++) await new Promise((r) => setTimeout(r, 5))
+      assert.ok(predicate(), 'independent task must start without waiting for its parent')
+    }
+    t.after(async () => {
+      for (const gate of gates.values()) gate.resolve()
+      await Promise.all(jobs)
+      sticky.db.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+    const parent = run('parent')
+    await until(() => started.has('parent'))
+    const a = run('a-first', 'a')
+    const b = run('b-first', 'b')
+    await until(() => started.size === 3)
+    assert.equal(new Set(started.values()).size, 3)
+    assert.equal(pool.seatSnapshot().global_queue_depth, 0)
+    const next = run('a-next', 'a')
+    await new Promise((r) => setImmediate(r))
+    assert.equal(started.has('a-next'), false)
+    assert.equal(pool.seatSnapshot().seats[started.get('a-first')].queue_depth, 1)
+    gates.get('a-first').resolve()
+    assert.equal((await a).ok, true)
+    await until(() => started.has('a-next'))
+    assert.equal(started.get('a-next'), started.get('a-first'))
+    for (const gate of gates.values()) gate.resolve()
+    for (const result of await Promise.all([parent, b, next])) assert.equal(result.ok, true)
+  })
+}

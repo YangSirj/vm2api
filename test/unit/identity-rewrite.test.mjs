@@ -11,6 +11,7 @@ import {
   resolveOutboundSessionId,
   resolveInboundIdentity,
   resolveSeatIdentity,
+  resolveTaskSession,
   sessionContextDiscriminator,
   REBUILD_SESSION_SEED,
   STABLE_SESSION_SEED,
@@ -391,17 +392,36 @@ test('resolveSeatIdentity: independent session first, device only as fallback, n
   })
 })
 
-test('seat identity separates conversations on one device and groups explicit parent/sub-agent hops', () => {
+test('seat identity separates Claude Code agents and preserves explicit grouping for other clients', () => {
   const body = (session_id) => ({ metadata: { user_id: { device_id: 'one-device', session_id } } })
   const first = resolveSeatIdentity({ inbound: body('first') })
   const other = resolveSeatIdentity({ inbound: body('other') })
   assert.notEqual(first.key, other.key)
-  assert.equal(
+  assert.notEqual(
     resolveSeatIdentity({ inbound: body('first'), headers: { 'x-claude-code-agent-id': 'agent-a' } }).key,
     first.key,
   )
   assert.equal(resolveSeatIdentity({ inbound: body('child'), rootSessionId: 'first' }).key, first.key)
   assert.equal(resolveSeatIdentity({ inbound: {}, headers: { 'x-session-id': 'header-session' } }).source, 'session')
+})
+
+test('agent task identity is stable across turns and independent of root and siblings', () => {
+  for (const metadata of [true, false]) {
+    const inbound = metadata ? { metadata: { user_id: { session_id: 'root', device_id: 'shared-device' } } } : {}
+    const task = (agent, extra = {}) => ({
+      inbound,
+      rootSessionId: 'root',
+      headers: { 'X-Claude-Code-Session-Id': 'root', 'X-Claude-Code-Agent-Id': agent, ...extra },
+    })
+    const a = task('a')
+    const b = task('b', { 'x-claude-code-parent-agent-id': 'a' })
+    assert.notEqual(resolveTaskSession(a), 'root')
+    assert.notEqual(resolveTaskSession(a), resolveTaskSession(b))
+    assert.equal(resolveTaskSession(a), extractCallerSession(a))
+    assert.equal(resolveSeatIdentity(a).key, `seat:sess:${resolveTaskSession(a)}`)
+    assert.equal(resolveTaskSession(task('a')), resolveTaskSession(a))
+    assert.notEqual(resolveSeatIdentity(a).key, resolveSeatIdentity(b).key)
+  }
 })
 
 test('resolveSeatIdentity: same IP + UA + first turn hashes to one identity whatever the API key', () => {

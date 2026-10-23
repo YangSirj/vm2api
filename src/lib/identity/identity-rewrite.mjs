@@ -270,13 +270,13 @@ function ephemeralCacheText(body = {}) {
 }
 
 /**
- * Independent conversations own seats. Explicit parent/root identity keeps
- * a task family together; a device is only the fallback without a session.
+ * Independent conversations and Claude Code agents own seats. Explicit
+ * parent/root grouping remains available for clients without an agent id.
  * The scheduler adds the owner scope. API keys never define a conversation.
  */
 export function resolveSeatIdentity({ inbound = {}, body = {}, headers = {}, clientIp = '', rootSessionId = '' } = {}) {
   const identity = resolveInboundIdentity({ inbound, body, headers })
-  const session = String(rootSessionId || rootCallerSession({ inbound, body, headers })).trim()
+  const session = resolveTaskSession({ inbound, body, headers, rootSessionId })
   if (session) return { key: `seat:sess:${session}`, source: 'session' }
   if (identity.deviceId) return { key: `seat:dev:${identity.deviceId}`, source: 'device' }
   if (isShortProbeRequest(inbound)) return { key: null, source: 'probe' }
@@ -325,6 +325,12 @@ export function claudeCodeAgentRootSession({ inbound = {}, body = {}, headers = 
  */
 export function extractCallerSession({ inbound = {}, body = {}, headers = {} } = {}) {
   return agentSessionId(rootCallerSession({ inbound, body, headers }), claudeCodeAgentId(headers))
+}
+
+/** A Claude Code agent is an independent scheduling task, including nested agents. */
+export function resolveTaskSession({ inbound = {}, body = {}, headers = {}, rootSessionId = '' } = {}) {
+  if (claudeCodeAgentId(headers)) return extractCallerSession({ inbound, body, headers }).trim()
+  return String(rootSessionId || rootCallerSession({ inbound, body, headers })).trim()
 }
 
 function rootCallerSession({ inbound, body, headers }) {
